@@ -1,6 +1,5 @@
 # NetBar
 
-[![macOS CI](https://github.com/HarenaGodz/NetBar/actions/workflows/ci.yml/badge.svg)](https://github.com/HarenaGodz/NetBar/actions/workflows/ci.yml)
 ![macOS 13+](https://img.shields.io/badge/macOS-13%2B-111111?logo=apple)
 ![Swift 5.10](https://img.shields.io/badge/Swift-5.10-F05138?logo=swift&logoColor=white)
 
@@ -60,6 +59,12 @@ open dist/NetBar.app
 
 ```bash
 ARCHS="$(uname -m)" ./build_app.sh
+```
+
+运行完整的本地测试、构建和签名检查：
+
+```bash
+./scripts/verify.sh
 ```
 
 启动后默认显示简约主窗口，同时也可从屏幕顶部菜单栏的当前网络状态进入。

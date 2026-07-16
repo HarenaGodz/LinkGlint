@@ -4,8 +4,8 @@
 
 ```text
 NetBar/
-├── .github/workflows/ci.yml        # macOS 自动测试与构建
 ├── Resources/                      # Info.plist 与应用图标
+├── scripts/verify.sh               # 本地测试、构建与签名验证
 ├── Sources/NetBar/                 # 菜单栏应用、界面与网络管理逻辑
 ├── Sources/NetBarHelper/           # 受限的本机权限助手
 ├── Tests/NetBarTests/              # 解析、偏好、方案和用量测试
