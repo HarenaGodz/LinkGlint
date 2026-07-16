@@ -1,0 +1,25 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+
+# Xcode user state
+xcuserdata/
+*.xcuserstate
+DerivedData/
+
+# Local build and regression artifacts
+dist/
+outputs/
+work/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*~

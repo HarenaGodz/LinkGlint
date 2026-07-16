@@ -1,0 +1,95 @@
+# NetBar
+
+[![macOS CI](https://github.com/HarenaGodz/NetBar/actions/workflows/ci.yml/badge.svg)](https://github.com/HarenaGodz/NetBar/actions/workflows/ci.yml)
+![macOS 13+](https://img.shields.io/badge/macOS-13%2B-111111?logo=apple)
+![Swift 5.10](https://img.shields.io/badge/Swift-5.10-F05138?logo=swift&logoColor=white)
+
+一个原生 macOS 网络管理工具。它会读取系统中的 Wi‑Fi、有线网络、VPN
+以及其他网络服务，并允许从主窗口或菜单栏启用、停用及切换指定服务；Wi‑Fi
+还可单独开关硬件。
+
+![NetBar 3.1.0 简约主界面](docs/images/netbar-3.1.0.png)
+
+## 下载
+
+预编译的 Intel 与 Apple Silicon 通用版本见 [GitHub Releases](https://github.com/HarenaGodz/NetBar/releases)。
+
+## 功能
+
+- 菜单栏以图标及“Wi‑Fi · 已连接 / 有线 · 已连接 / VPN · 已连接 / 离线”等文字实时显示当前网络状态
+- 简约原生主窗口：当前网络、方案和适配器开关一眼可见
+- DNS、优先级、复制与切换等进阶操作统一收纳到每个适配器的“⋯”菜单
+- 诊断、报告、用量、方案管理和系统设置统一收纳到“工具”菜单
+- 关闭主窗口后自动移除 Dock 图标，程序和当前网络状态继续留在菜单栏
+- 列出系统所有网络服务、设备名、连接状态与 IP 地址
+- 显示默认出口、SSID、子网掩码、路由器、DNS 与 MAC 地址
+- 单独启用/停用任意网络服务
+- 一键切换到指定的 Wi‑Fi 或有线网络服务，并停用其他物理网络服务
+- 单独打开/关闭 Wi‑Fi 硬件
+- 系统网络路径发生变化时实时刷新，并保留每 12 秒定时刷新
+- 每 2 秒显示各网络接口的实时下载/上传速率
+- 一键复制 IP 地址或完整网络信息
+- 一键检查默认网关延迟与 DNS 查询状态
+- 复制或导出包含系统、路由、DNS、适配器和实时流量的诊断报告
+- 内置“全部启用”“仅 Wi-Fi”“仅有线网络”三种快速配置方案
+- 保存当前全部网络服务及 Wi-Fi 电源状态为自定义快照
+- 从主窗口或菜单栏一键恢复、覆盖或删除自定义配置方案
+- 统计当天与本次运行的下载/上传流量，并保留最近 30 天记录
+- 查看最近 7 天用量、重置今日统计，诊断报告中自动附带用量历史
+- 偏好设置可切换菜单栏文字、启动时主窗口及网络变化自动诊断
+- 查看每项网络服务的系统优先级并一键提升至最高优先级
+- 为任意网络服务设置多个 IPv4/IPv6 DNS，留空即可恢复自动 DNS
+- DNS 输入支持逗号、空格或换行分隔，并在应用前校验和去重
+- 原生“登录时启动”开关（若系统要求，可直接打开登录项设置批准）
+- 首次配置时只需一次 macOS 管理员授权，之后日常网络切换、DNS 与优先级修改不再输入密码
+- 重新打开应用或从菜单栏选择“显示主窗口”时，Dock 图标随窗口恢复
+- 快速打开 macOS 网络设置
+
+## 构建
+
+需要 macOS 13 或更新版本及 Xcode Command Line Tools：
+
+```bash
+chmod +x build_app.sh
+./build_app.sh
+open dist/NetBar.app
+```
+
+构建后的应用位于 `dist/NetBar.app`，默认同时支持 Apple Silicon 与 Intel Mac。
+若只构建当前架构，可运行：
+
+```bash
+ARCHS="$(uname -m)" ./build_app.sh
+```
+
+启动后默认显示简约主窗口，同时也可从屏幕顶部菜单栏的当前网络状态进入。
+关闭窗口时 Dock 图标会自动隐藏，但菜单栏状态、定时刷新和网络切换会继续运行；
+重新打开应用或选择“显示主窗口”即可恢复窗口。
+若正在使用菜单栏整理工具而暂时看不到状态，请先展开隐藏区域，再按住 `⌘`
+将 NetBar 拖到分隔符右侧的常驻区域；主窗口和偏好设置中也保留了这条提示。
+
+## 开机启动
+
+从菜单栏或偏好设置打开“登录时启动”即可使用 macOS 原生登录项。若系统显示“需要批准”，
+按应用提示在“系统设置 → 通用 → 登录项”中允许 NetBar。此设置不要求管理员密码。
+
+## 首次权限配置
+
+点击主窗口的“首次配置…”并完成一次 macOS 管理员授权。NetBar 会将一个受限助手
+安装到 `/Library/PrivilegedHelperTools/local.codex.NetBarHelper`，并为当前用户创建
+仅限该助手的 `sudo -n` 规则。之后启用/停用适配器、Wi‑Fi 电源、DNS、优先级、
+配置方案和一键切换均不会再次弹出密码窗口。
+
+助手由 `root:wheel` 持有且不可由普通用户写入；它只接受固定的网络操作，直接启动
+`/usr/sbin/networksetup`，不接收任意程序路径或 Shell 命令。可随时从偏好设置移除，
+移除动作会再次请求一次管理员授权。
+
+## 实现说明
+
+程序通过 macOS 自带的 `/usr/sbin/networksetup` 读取及更改网络配置，并通过
+`/sbin/ifconfig` 判断链路状态。安装阶段的固定脚本仅通过位置参数接收路径和账号；
+日常网络修改由受限助手直接执行，不使用 Shell 拼接用户可见的网络服务名称。
+
+项目目录及运行结构见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)，版本变化见
+[`CHANGELOG.md`](CHANGELOG.md)。构建产物、测试临时文件和本地发布包均通过
+`.gitignore` 排除，不进入源码仓库。
