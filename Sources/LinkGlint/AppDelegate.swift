@@ -10,6 +10,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var statusItem: NSStatusItem!
     private let statusPopover = NSPopover()
     private var statusContextMenu: NSMenu?
+    private var statusPanelServicesSnapshot: [NetworkService]?
+    private weak var statusPanelUsageLabel: NSTextField?
     private var mainWindow: NSWindow!
     private var preferencesWindow: NSWindow?
     private var servicesStack: NSStackView!
@@ -38,11 +40,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var isSamplingTraffic = false
     private var isDiagnosing = false
     private var lastServices: [NetworkService] = []
+    private var renderedWindowServices: [NetworkService]?
     private var lastDiagnostic: NetworkDiagnostic?
     private var previousTrafficCounters: [String: InterfaceCounters] = [:]
     private var previousTrafficSampleDate: Date?
     private var currentDownloadBytesPerSecond: Double = 0
     private var currentUploadBytesPerSecond: Double = 0
+    private var lastMenuBarRenderKey: String?
     private var trafficLabels: [String: NSTextField] = [:]
     private var lastAutoDiagnosticAt: Date?
     private var hasLoadedNetworkState = false
@@ -151,6 +155,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         statusItem.button?.title = "仍在菜单栏运行"
         statusItem.button?.imagePosition = .imageLeading
         statusItem.button?.toolTip = "LinkGlint 仍在菜单栏运行；从菜单选择“退出 LinkGlint”可完全结束"
+        lastMenuBarRenderKey = nil
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.4) { [weak self] in
             self?.applyMenuBarAppearance()
             self?.updateStatusIcon(self?.lastServices ?? [])
@@ -179,9 +184,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 DispatchQueue.main.async {
                     self.isRefreshing = false
                     self.hasLoadedNetworkState = true
+                    let servicesChanged = services != self.lastServices
                     self.lastServices = services
-                    self.rebuildMenu(with: services)
-                    self.rebuildWindow(with: services)
+                    if servicesChanged {
+                        self.rebuildMenu(with: services)
+                        if self.mainWindow?.isVisible == true {
+                            self.rebuildWindow(with: services)
+                        }
+                    } else {
+                        // Most 12-second refreshes contain identical data. Avoid
+                        // reconstructing every menu, card and Auto Layout tree.
+                        self.updateStatusIcon(services)
+                    }
                     self.sampleTraffic()
                 }
             } catch {
@@ -194,6 +208,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func rebuildMenu(with services: [NetworkService]) {
+        statusPanelServicesSnapshot = nil
         let menu = NSMenu()
 
         let connectedCount = services.filter(\.connected).count
@@ -221,7 +236,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         menu.addItem(.separator())
         addFooter(to: menu)
         statusContextMenu = menu
-        rebuildStatusPanel(with: services)
+        if statusPopover.isShown {
+            rebuildStatusPanel(with: services)
+        }
         updateStatusIcon(services)
     }
 
@@ -447,11 +464,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func updateStatusIcon(_ services: [NetworkService]) {
         let active = services.first(where: { $0.isPrimary && $0.connected })
             ?? services.first(where: \.connected)
-        let presentation = NetworkStatusPresentation.make(services: services, hasLoaded: hasLoadedNetworkState)
-        statusItem.button?.image = menuBarImage(
-            symbolName: presentation.symbolName,
-            accessibilityDescription: presentation.title
-        )
         applyMenuBarAppearance()
         statusItem.button?.toolTip = active.map {
             var text = "LinkGlint · 已连接 · \($0.name)"
@@ -475,12 +487,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if statusPopover.isShown {
             statusPopover.performClose(sender)
         } else {
-            rebuildStatusPanel(with: lastServices)
+            if statusPopover.contentViewController == nil || statusPanelServicesSnapshot != lastServices {
+                rebuildStatusPanel(with: lastServices)
+            }
             statusPopover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            updateUsageDisplay()
         }
     }
 
     private func rebuildStatusPanel(with services: [NetworkService]) {
+        statusPanelServicesSnapshot = services
         let width: CGFloat = 404
         let visibleRows = min(max(services.count, 1), 5)
         let rowViewportHeight = CGFloat(visibleRows * 56 + max(visibleRows - 1, 0) * 6)
@@ -687,6 +703,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func statusPanelFooter(services: [NetworkService]) -> NSView {
         let usage = usageTracker.usage()
         let usageText = NSTextField(labelWithString: "今日 ↓ \(formatBytes(usage.receivedBytes))  ↑ \(formatBytes(usage.sentBytes))")
+        statusPanelUsageLabel = usageText
         usageText.font = .monospacedDigitSystemFont(ofSize: 9.5, weight: .regular)
         usageText.textColor = .tertiaryLabelColor
         let usageSpacer = NSView()
@@ -884,7 +901,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             totalReceived &+= received
                             totalSent &+= sent
                         }
-                        if let label = self.trafficLabels[device] {
+                        if self.mainWindow?.isVisible == true, let label = self.trafficLabels[device] {
                             label.stringValue = "↓ \(self.formatRate(Double(received) / interval))   ↑ \(self.formatRate(Double(sent) / interval))"
                         }
                     }
@@ -938,6 +955,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             usesTwoLines: preferences.menuBarSpeedTwoLines,
             usesBits: preferences.menuBarSpeedInBits
         )
+        let renderKey = "\(networkPresentation.symbolName)|\(presentation.usesTwoLines)|\(presentation.text)"
+        guard renderKey != lastMenuBarRenderKey else { return }
+        lastMenuBarRenderKey = renderKey
         if presentation.usesTwoLines {
             button.attributedTitle = NSAttributedString(string: "")
             button.image = twoLineMenuBarImage(
@@ -1523,7 +1543,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func updateUsageDisplay() {
         let today = usageTracker.usage()
         let text = "今日  ↓ \(formatBytes(today.receivedBytes))   ↑ \(formatBytes(today.sentBytes))"
-        usageLabel?.stringValue = text
+        if mainWindow?.isVisible == true { usageLabel?.stringValue = text }
+        if statusPopover.isShown {
+            statusPanelUsageLabel?.stringValue = "今日 ↓ \(formatBytes(today.receivedBytes))  ↑ \(formatBytes(today.sentBytes))"
+        }
         if let item = statusContextMenu?.items.first(where: { $0.identifier?.rawValue == "daily-usage" }) {
             item.title = "今日用量：↓ \(formatBytes(today.receivedBytes)) · ↑ \(formatBytes(today.sentBytes))"
         }
@@ -1923,7 +1946,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc private func showMainWindow() {
         NSApp.setActivationPolicy(.regular)
+        if hasLoadedNetworkState, renderedWindowServices != lastServices {
+            rebuildWindow(with: lastServices)
+        }
         mainWindow?.makeKeyAndOrderFront(nil)
+        updateUsageDisplay()
         NSApp.activate(ignoringOtherApps: true)
     }
 
@@ -2208,6 +2235,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func rebuildWindow(with services: [NetworkService]) {
+        renderedWindowServices = services
         if let primary = services.first(where: { $0.isPrimary && $0.connected }) {
             var text = "当前网络：\(primary.name)"
             if let ssid = primary.ssid { text += " · \(ssid)" }

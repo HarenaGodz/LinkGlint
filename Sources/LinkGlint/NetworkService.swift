@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import Darwin
 
 struct NetworkService: Hashable {
     enum Kind {
@@ -180,8 +181,29 @@ final class NetworkManager {
     }
 
     func fetchTrafficCounters() throws -> [String: InterfaceCounters] {
-        let output = try CommandRunner.run("/usr/sbin/netstat", ["-ibn"])
-        return parseTrafficCounters(output)
+        var firstAddress: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&firstAddress) == 0, let firstAddress else {
+            throw NetworkError.commandFailed("读取网络流量计数器失败。")
+        }
+        defer { freeifaddrs(firstAddress) }
+
+        var result: [String: InterfaceCounters] = [:]
+        var cursor: UnsafeMutablePointer<ifaddrs>? = firstAddress
+        while let pointer = cursor {
+            let interface = pointer.pointee
+            if let address = interface.ifa_addr,
+               address.pointee.sa_family == UInt8(AF_LINK),
+               let rawData = interface.ifa_data {
+                let name = String(cString: interface.ifa_name)
+                let data = rawData.assumingMemoryBound(to: if_data.self).pointee
+                result[name] = InterfaceCounters(
+                    receivedBytes: UInt64(data.ifi_ibytes),
+                    sentBytes: UInt64(data.ifi_obytes)
+                )
+            }
+            cursor = interface.ifa_next
+        }
+        return result
     }
 
     func runDiagnostics() -> NetworkDiagnostic {
