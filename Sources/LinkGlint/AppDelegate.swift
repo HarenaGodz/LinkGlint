@@ -2,6 +2,17 @@ import AppKit
 import Network
 import ServiceManagement
 
+/// Shared four-point-grid metrics for the menu-bar panel and main window.
+private enum LinkGlintLayout {
+    static let compactGap: CGFloat = 4
+    static let standardGap: CGFloat = 8
+    static let panelWidth: CGFloat = 388
+    static let panelRowHeight: CGFloat = 46
+    static let mainRowHeight: CGFloat = 52
+    static let rowRadius: CGFloat = 8
+    static let sectionRadius: CGFloat = 10
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopoverDelegate {
     private let manager = NetworkManager()
     private let profileStore = NetworkProfileStore()
@@ -513,11 +524,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
 
     private func rebuildStatusPanel(with services: [NetworkService]) {
         statusPanelServicesSnapshot = services
-        let width: CGFloat = 404
+        let width = LinkGlintLayout.panelWidth
         let visibleRows = min(max(services.count, 1), 5)
-        let rowViewportHeight = CGFloat(visibleRows * 56 + max(visibleRows - 1, 0) * 6)
-        let permissionHeight: CGFloat = manager.privilegedAccessState == .ready ? 0 : 34
-        let height: CGFloat = 236 + permissionHeight + rowViewportHeight
+        let rowViewportHeight = CGFloat(visibleRows) * LinkGlintLayout.panelRowHeight
+            + CGFloat(max(visibleRows - 1, 0)) * LinkGlintLayout.compactGap
+        let permissionHeight: CGFloat = manager.privilegedAccessState == .ready ? 0 : 30
+        let height: CGFloat = 128 + permissionHeight + rowViewportHeight
         let controller = NSViewController()
         // NSPopover already supplies the window shape and shadow. A second
         // vibrancy layer here used to blend strongly with colorful wallpapers,
@@ -526,54 +538,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         let root = StatusPanelBackgroundView(frame: NSRect(x: 0, y: 0, width: width, height: height))
         controller.view = root
 
-        let active = services.first(where: { $0.isPrimary && $0.connected })
-            ?? services.first(where: \.connected)
-        let presentation = NetworkStatusPresentation.make(services: services, hasLoaded: hasLoadedNetworkState)
-        let headerIcon = NSImageView()
-        headerIcon.image = NSImage(systemSymbolName: presentation.symbolName, accessibilityDescription: presentation.title)
-        headerIcon.symbolConfiguration = .init(pointSize: 24, weight: .semibold)
-        headerIcon.contentTintColor = active == nil ? .secondaryLabelColor : statusColor(for: active!.kind)
-        headerIcon.translatesAutoresizingMaskIntoConstraints = false
-
-        let headline = NSTextField(labelWithString: panelNetworkName(active))
-        headline.font = .systemFont(ofSize: 17, weight: .semibold)
-        headline.lineBreakMode = .byTruncatingTail
-        let subheadline = NSTextField(labelWithString: panelNetworkDetail(active))
-        subheadline.font = .systemFont(ofSize: 11)
-        subheadline.textColor = .secondaryLabelColor
-        subheadline.lineBreakMode = .byTruncatingTail
-        let headingText = NSStackView(views: [headline, subheadline])
-        headingText.orientation = .vertical
-        headingText.alignment = .leading
-        headingText.spacing = 2
-        headingText.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let headingSpacer = NSView()
-        headingSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let currentBadge = statusPanelBadge(active == nil ? "离线" : "当前", color: active == nil ? .systemGray : .systemGreen)
         let refreshButton = compactIconButton(symbol: "arrow.clockwise", label: "刷新", action: #selector(refresh))
-        let header = NSStackView(views: [headerIcon, headingText, headingSpacer, currentBadge, refreshButton])
-        header.orientation = .horizontal
-        header.alignment = .centerY
-        header.spacing = 10
-        header.translatesAutoresizingMaskIntoConstraints = false
-
-        let hero = NSBox()
-        hero.boxType = .custom
-        hero.cornerRadius = 13
-        hero.borderWidth = 1
-        let heroColor = active.map { statusColor(for: $0.kind) } ?? .systemGray
-        hero.borderColor = heroColor.withAlphaComponent(0.24)
-        hero.fillColor = heroColor.withAlphaComponent(0.075)
-        hero.contentView?.addSubview(header)
-        NSLayoutConstraint.activate([
-            header.topAnchor.constraint(equalTo: hero.contentView!.topAnchor, constant: 11),
-            header.bottomAnchor.constraint(equalTo: hero.contentView!.bottomAnchor, constant: -11),
-            header.leadingAnchor.constraint(equalTo: hero.contentView!.leadingAnchor, constant: 12),
-            header.trailingAnchor.constraint(equalTo: hero.contentView!.trailingAnchor, constant: -9)
-        ])
+        refreshButton.translatesAutoresizingMaskIntoConstraints = false
 
         let brandTitle = NSTextField(labelWithString: "LinkGlint")
-        brandTitle.font = .systemFont(ofSize: 14, weight: .bold)
+        brandTitle.font = .systemFont(ofSize: 13.5, weight: .bold)
         brandTitle.alignment = .center
         brandTitle.translatesAutoresizingMaskIntoConstraints = false
         let brandDivider = NSBox()
@@ -583,21 +552,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         brandHeader.translatesAutoresizingMaskIntoConstraints = false
         brandHeader.addSubview(brandTitle)
         brandHeader.addSubview(brandDivider)
+        brandHeader.addSubview(refreshButton)
         NSLayoutConstraint.activate([
             brandTitle.centerXAnchor.constraint(equalTo: brandHeader.centerXAnchor),
             brandTitle.topAnchor.constraint(equalTo: brandHeader.topAnchor),
+            refreshButton.centerYAnchor.constraint(equalTo: brandTitle.centerYAnchor),
+            refreshButton.trailingAnchor.constraint(equalTo: brandHeader.trailingAnchor),
             brandDivider.leadingAnchor.constraint(equalTo: brandHeader.leadingAnchor),
             brandDivider.trailingAnchor.constraint(equalTo: brandHeader.trailingAnchor),
             brandDivider.bottomAnchor.constraint(equalTo: brandHeader.bottomAnchor),
-            brandHeader.heightAnchor.constraint(equalToConstant: 24)
+            brandHeader.heightAnchor.constraint(equalToConstant: 22)
         ])
 
         let sectionLabel = NSTextField(labelWithString: "网络服务")
         sectionLabel.font = .systemFont(ofSize: 11, weight: .semibold)
         sectionLabel.textColor = .secondaryLabelColor
         let sectionCount = NSTextField(labelWithString: "\(services.filter(\.connected).count) 个已连接 · \(services.filter(\.enabled).count) 个已启用")
-        sectionCount.font = .systemFont(ofSize: 9.5)
-        sectionCount.textColor = .tertiaryLabelColor
+        sectionCount.font = .systemFont(ofSize: 10)
+        sectionCount.textColor = .secondaryLabelColor
         sectionCount.alignment = .right
         let sectionSpacer = NSView()
         sectionSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -608,7 +580,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         let rows = NSStackView()
         rows.orientation = .vertical
         rows.alignment = .width
-        rows.spacing = 6
+        rows.spacing = LinkGlintLayout.compactGap
         rows.translatesAutoresizingMaskIntoConstraints = false
         if services.isEmpty {
             let empty = NSTextField(labelWithString: hasLoadedNetworkState ? "未发现网络服务" : "正在读取网络状态…")
@@ -639,20 +611,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         ])
 
         let footer = statusPanelFooter(services: services)
-        let stack = NSStackView(views: [brandHeader, hero, sectionHeader, scroll, footer])
+        let stack = NSStackView(views: [brandHeader, sectionHeader, scroll, footer])
         stack.orientation = .vertical
         stack.alignment = .width
-        stack.spacing = 7
+        stack.spacing = 6
         stack.translatesAutoresizingMaskIntoConstraints = false
         root.addSubview(stack)
         NSLayoutConstraint.activate([
             stack.topAnchor.constraint(equalTo: root.topAnchor, constant: 8),
-            stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 14),
-            stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -14),
+            stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
+            stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
             stack.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -8),
-            headerIcon.widthAnchor.constraint(equalToConstant: 31),
-            headerIcon.heightAnchor.constraint(equalToConstant: 31),
-            hero.heightAnchor.constraint(greaterThanOrEqualToConstant: 58),
             scroll.heightAnchor.constraint(equalToConstant: rowViewportHeight)
         ])
         statusPopover.contentViewController = controller
@@ -662,14 +631,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
     private func statusPanelServiceRow(_ service: NetworkService, allServices: [NetworkService]) -> NSView {
         let icon = NSImageView()
         icon.image = symbol(for: service)
-        icon.symbolConfiguration = .init(pointSize: 17, weight: .medium)
+        icon.symbolConfiguration = .init(pointSize: 15, weight: .medium)
         icon.contentTintColor = service.connected ? statusColor(for: service.kind) : .secondaryLabelColor
         icon.translatesAutoresizingMaskIntoConstraints = false
 
         let visibleName = service.kind == .wifi && service.connected ? (service.ssid ?? service.name) : service.name
         let name = NSTextField(labelWithString: visibleName)
-        name.font = .systemFont(ofSize: 12.5, weight: service.connected ? .semibold : .regular)
+        name.font = .systemFont(ofSize: 12, weight: service.connected ? .semibold : .regular)
         name.lineBreakMode = .byTruncatingTail
+        name.toolTip = visibleName
         var details = ["优先级 \(service.orderIndex + 1)", networkKindName(service.kind), service.connected ? "已连接" : (service.enabled ? "可用" : "已停用")]
         if visibleName != service.name { details.append(service.name) }
         if let ip = service.ipAddress { details.append(ip) }
@@ -677,6 +647,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         detail.font = .systemFont(ofSize: 10)
         detail.textColor = .secondaryLabelColor
         detail.lineBreakMode = .byTruncatingTail
+        detail.toolTip = detail.stringValue
         let labels = NSStackView(views: [name, detail])
         labels.orientation = .vertical
         labels.alignment = .leading
@@ -686,11 +657,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
         var views: [NSView] = [icon, labels, spacer]
+        if service.isPrimary && service.connected {
+            views.append(statusPanelBadge("当前", color: statusColor(for: service.kind)))
+        }
         if (service.kind == .wifi || service.kind == .ethernet) && !service.isPrimary {
             let others = allServices.filter {
                 $0.name != service.name && $0.enabled && ($0.kind == .wifi || $0.kind == .ethernet)
             }.map(\.name)
-            let use = NetworkActionButton(title: "接入", target: self, action: #selector(windowSwitchToService(_:)))
+            let use = NetworkActionButton(title: "切换", target: self, action: #selector(windowSwitchToService(_:)))
             use.bezelStyle = .rounded
             use.controlSize = .small
             use.payload = ["target": service.name, "others": others, "wifiDevice": service.kind == .wifi ? (service.device ?? "") : ""]
@@ -709,25 +683,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         let row = NSStackView(views: views)
         row.orientation = .horizontal
         row.alignment = .centerY
-        row.spacing = 8
-        row.edgeInsets = NSEdgeInsets(top: 5, left: 5, bottom: 5, right: 1)
+        row.spacing = 7
+        row.edgeInsets = NSEdgeInsets(top: 3, left: 3, bottom: 3, right: 0)
         row.translatesAutoresizingMaskIntoConstraints = false
         let card = NSBox()
         card.boxType = .custom
-        card.cornerRadius = 9
-        card.borderWidth = 1
+        card.cornerRadius = LinkGlintLayout.rowRadius
+        card.borderWidth = service.connected ? 1 : 0
         let accent = statusColor(for: service.kind)
         card.borderColor = service.connected
             ? accent.withAlphaComponent(0.25)
-            : NSColor.separatorColor.withAlphaComponent(0.42)
+            : .clear
         card.fillColor = service.connected
             ? accent.withAlphaComponent(0.055)
-            : NSColor.controlBackgroundColor.withAlphaComponent(service.enabled ? 0.30 : 0.16)
+            : NSColor.controlBackgroundColor.withAlphaComponent(service.enabled ? 0.22 : 0.10)
         card.contentView?.addSubview(row)
         NSLayoutConstraint.activate([
-            card.heightAnchor.constraint(greaterThanOrEqualToConstant: 56),
-            icon.widthAnchor.constraint(equalToConstant: 23),
-            icon.heightAnchor.constraint(equalToConstant: 23),
+            card.heightAnchor.constraint(equalToConstant: LinkGlintLayout.panelRowHeight),
+            icon.widthAnchor.constraint(equalToConstant: 21),
+            icon.heightAnchor.constraint(equalToConstant: 21),
             row.topAnchor.constraint(equalTo: card.contentView!.topAnchor, constant: 1),
             row.bottomAnchor.constraint(equalTo: card.contentView!.bottomAnchor, constant: -1),
             row.leadingAnchor.constraint(equalTo: card.contentView!.leadingAnchor, constant: 4),
@@ -740,13 +714,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         let usage = usageTracker.usage()
         let usageText = NSTextField(labelWithString: "今日 ↓ \(formatBytes(usage.receivedBytes))  ↑ \(formatBytes(usage.sentBytes))")
         statusPanelUsageLabel = usageText
-        usageText.font = .monospacedDigitSystemFont(ofSize: 9.5, weight: .regular)
-        usageText.textColor = .tertiaryLabelColor
+        usageText.font = .monospacedDigitSystemFont(ofSize: 10, weight: .regular)
+        usageText.textColor = .secondaryLabelColor
         let usageSpacer = NSView()
         usageSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let menuHint = NSTextField(labelWithString: "右键状态栏显示完整菜单")
-        menuHint.font = .systemFont(ofSize: 9.5)
-        menuHint.textColor = .tertiaryLabelColor
+        let menuHint = NSTextField(labelWithString: "右键查看更多")
+        menuHint.font = .systemFont(ofSize: 10)
+        menuHint.textColor = .secondaryLabelColor
         let usageRow = NSStackView(views: [usageText, usageSpacer, menuHint])
         usageRow.orientation = .horizontal
         usageRow.alignment = .centerY
@@ -757,7 +731,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
             views.append(priority)
         }
         if let wifiDevice = services.first(where: { $0.kind == .wifi })?.device {
-            let join = NetworkActionButton(title: "连接其他 Wi‑Fi…", target: self, action: #selector(showJoinWiFi(_:)))
+            let join = NetworkActionButton(title: "加入 Wi‑Fi…", target: self, action: #selector(showJoinWiFi(_:)))
             join.bezelStyle = .rounded
             join.controlSize = .small
             join.payload = ["device": wifiDevice]
@@ -775,7 +749,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         let actions = NSStackView(views: views)
         actions.orientation = .horizontal
         actions.alignment = .centerY
-        actions.spacing = 7
+        actions.spacing = LinkGlintLayout.compactGap
 
         var footerViews: [NSView] = []
         if manager.privilegedAccessState != .ready {
@@ -796,7 +770,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         let footer = NSStackView(views: footerViews)
         footer.orientation = .vertical
         footer.alignment = .width
-        footer.spacing = 7
+        footer.spacing = LinkGlintLayout.compactGap
         return footer
     }
 
@@ -865,20 +839,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
     @objc private func showMainWindowFromPanel() {
         statusPopover.close()
         showMainWindow()
-    }
-
-    private func panelNetworkName(_ service: NetworkService?) -> String {
-        guard let service else { return hasLoadedNetworkState ? "当前离线" : "正在检测网络…" }
-        if service.kind == .wifi { return service.ssid ?? service.name }
-        return service.name
-    }
-
-    private func panelNetworkDetail(_ service: NetworkService?) -> String {
-        guard let service else { return hasLoadedNetworkState ? "当前离线" : "正在检测网络…" }
-        var parts = [networkKindName(service.kind), "已连接"]
-        if service.kind == .wifi, service.ssid != nil { parts.append(service.name) }
-        if let ip = service.ipAddress { parts.append(ip) }
-        return parts.joined(separator: " · ")
     }
 
     private func networkKindName(_ kind: NetworkService.Kind) -> String {
@@ -2108,13 +2068,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
 
     private func createMainWindow() {
         mainWindow = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 780, height: 610),
+            contentRect: NSRect(x: 0, y: 0, width: 760, height: 540),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         mainWindow.title = "LinkGlint"
-        mainWindow.minSize = NSSize(width: 680, height: 480)
+        mainWindow.minSize = NSSize(width: 650, height: 440)
         mainWindow.isReleasedWhenClosed = false
         mainWindow.titlebarAppearsTransparent = true
         mainWindow.delegate = self
@@ -2129,12 +2089,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         // Compact header: current connection first, advanced actions behind icons.
         let headerIcon = NSImageView()
         headerIcon.image = NSImage(systemSymbolName: "network", accessibilityDescription: "LinkGlint")
-        headerIcon.symbolConfiguration = .init(pointSize: 24, weight: .semibold)
+        headerIcon.symbolConfiguration = .init(pointSize: 21, weight: .semibold)
         headerIcon.contentTintColor = .systemBlue
         headerIcon.translatesAutoresizingMaskIntoConstraints = false
 
         let title = NSTextField(labelWithString: "LinkGlint")
-        title.font = .systemFont(ofSize: 21, weight: .bold)
+        title.font = .systemFont(ofSize: 18, weight: .bold)
         overviewLabel = NSTextField(labelWithString: "正在读取网络状态…")
         overviewLabel.font = .systemFont(ofSize: 12)
         overviewLabel.textColor = .secondaryLabelColor
@@ -2172,12 +2132,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         let header = NSStackView(views: [headerIcon, titleStack, headerSpacer, accessCompactLabel, refreshButton, hideButton, preferencesButton])
         header.orientation = .horizontal
         header.alignment = .centerY
-        header.spacing = 9
+        header.spacing = LinkGlintLayout.standardGap
 
         // This compact banner is visible only until the one-time setup is ready.
         accessBanner = NSBox()
         accessBanner.boxType = .custom
-        accessBanner.cornerRadius = 10
+        accessBanner.cornerRadius = LinkGlintLayout.sectionRadius
         accessBanner.borderWidth = 1
 
         let shield = NSImageView()
@@ -2239,7 +2199,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
 
         let profilePanel = NSBox()
         profilePanel.boxType = .custom
-        profilePanel.cornerRadius = 10
+        profilePanel.cornerRadius = LinkGlintLayout.sectionRadius
         profilePanel.borderWidth = 1
         profilePanel.borderColor = NSColor.separatorColor.withAlphaComponent(0.65)
         profilePanel.fillColor = NSColor.controlBackgroundColor.withAlphaComponent(0.56)
@@ -2247,10 +2207,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         updateProfilePopup()
 
         let adaptersTitle = NSTextField(labelWithString: "网络适配器")
-        adaptersTitle.font = .systemFont(ofSize: 14, weight: .semibold)
+        adaptersTitle.font = .systemFont(ofSize: 12.5, weight: .semibold)
         let adapterHint = NSTextField(labelWithString: "开关用于启用或停用 · 更多操作在 ⋯")
         adapterHint.font = .systemFont(ofSize: 10.5)
-        adapterHint.textColor = .tertiaryLabelColor
+        adapterHint.textColor = .secondaryLabelColor
         let adapterHeaderSpacer = NSView()
         adapterHeaderSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         let adapterHeader = NSStackView(views: [adaptersTitle, adapterHeaderSpacer, adapterHint])
@@ -2260,7 +2220,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         servicesStack = NSStackView()
         servicesStack.orientation = .vertical
         servicesStack.alignment = .width
-        servicesStack.spacing = 8
+        servicesStack.spacing = LinkGlintLayout.compactGap
         servicesStack.translatesAutoresizingMaskIntoConstraints = false
         let loading = NSTextField(labelWithString: "正在读取网络状态…")
         loading.alignment = .center
@@ -2300,29 +2260,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         let root = NSStackView(views: [header, accessBanner, profilePanel, adapterHeader, scroll, diagnosticLabel, footer])
         root.orientation = .vertical
         root.alignment = .width
-        root.spacing = 10
+        root.spacing = LinkGlintLayout.standardGap
         root.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(root)
 
         NSLayoutConstraint.activate([
-            root.topAnchor.constraint(equalTo: content.topAnchor, constant: 17),
-            root.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
-            root.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
-            root.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -15),
-            headerIcon.widthAnchor.constraint(equalToConstant: 32),
-            headerIcon.heightAnchor.constraint(equalToConstant: 32),
+            root.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
+            root.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
+            root.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            root.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12),
+            headerIcon.widthAnchor.constraint(equalToConstant: 28),
+            headerIcon.heightAnchor.constraint(equalToConstant: 28),
             shield.widthAnchor.constraint(equalToConstant: 22),
             shield.heightAnchor.constraint(equalToConstant: 22),
-            accessRow.topAnchor.constraint(equalTo: accessBanner.contentView!.topAnchor, constant: 8),
-            accessRow.bottomAnchor.constraint(equalTo: accessBanner.contentView!.bottomAnchor, constant: -8),
+            accessRow.topAnchor.constraint(equalTo: accessBanner.contentView!.topAnchor, constant: 6),
+            accessRow.bottomAnchor.constraint(equalTo: accessBanner.contentView!.bottomAnchor, constant: -6),
             accessRow.leadingAnchor.constraint(equalTo: accessBanner.contentView!.leadingAnchor, constant: 12),
             accessRow.trailingAnchor.constraint(equalTo: accessBanner.contentView!.trailingAnchor, constant: -12),
             profilePopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 170),
-            profileRow.topAnchor.constraint(equalTo: profilePanel.contentView!.topAnchor, constant: 9),
-            profileRow.bottomAnchor.constraint(equalTo: profilePanel.contentView!.bottomAnchor, constant: -9),
+            profileRow.topAnchor.constraint(equalTo: profilePanel.contentView!.topAnchor, constant: 6),
+            profileRow.bottomAnchor.constraint(equalTo: profilePanel.contentView!.bottomAnchor, constant: -6),
             profileRow.leadingAnchor.constraint(equalTo: profilePanel.contentView!.leadingAnchor, constant: 12),
             profileRow.trailingAnchor.constraint(equalTo: profilePanel.contentView!.trailingAnchor, constant: -12),
-            scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 210),
+            scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 190),
             document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
             servicesStack.topAnchor.constraint(equalTo: document.topAnchor, constant: 2),
             servicesStack.leadingAnchor.constraint(equalTo: document.leadingAnchor, constant: 1),
@@ -2341,8 +2301,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         button.setAccessibilityLabel(label)
         button.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
-            button.widthAnchor.constraint(equalToConstant: 32),
-            button.heightAnchor.constraint(equalToConstant: 28)
+            button.widthAnchor.constraint(equalToConstant: 28),
+            button.heightAnchor.constraint(equalToConstant: 26)
         ])
         return button
     }
@@ -2421,8 +2381,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
     private func serviceCard(_ service: NetworkService, allServices: [NetworkService]) -> NSView {
         let card = NSBox()
         card.boxType = .custom
-        card.cornerRadius = 10
-        card.borderWidth = 1
+        card.cornerRadius = LinkGlintLayout.rowRadius
+        card.borderWidth = service.connected ? 1 : 0
         let accentColor: NSColor
         switch service.kind {
         case .wifi: accentColor = .systemBlue
@@ -2431,43 +2391,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         case .other: accentColor = .systemGray
         }
         card.borderColor = service.connected
-            ? accentColor.withAlphaComponent(0.34)
-            : NSColor.separatorColor.withAlphaComponent(0.58)
+            ? accentColor.withAlphaComponent(0.28)
+            : .clear
         card.fillColor = service.connected
-            ? accentColor.withAlphaComponent(0.045)
-            : NSColor.controlBackgroundColor.withAlphaComponent(0.40)
+            ? accentColor.withAlphaComponent(0.055)
+            : NSColor.controlBackgroundColor.withAlphaComponent(service.enabled ? 0.24 : 0.11)
         card.translatesAutoresizingMaskIntoConstraints = false
 
         let iconView = NSImageView()
         iconView.image = symbol(for: service)
         iconView.contentTintColor = service.connected ? accentColor : .secondaryLabelColor
-        iconView.symbolConfiguration = .init(pointSize: 19, weight: .medium)
+        iconView.symbolConfiguration = .init(pointSize: 17, weight: .medium)
         iconView.translatesAutoresizingMaskIntoConstraints = false
 
-        let nameText = service.name + (service.isPrimary ? "  ·  默认" : "")
-        let name = NSTextField(labelWithString: nameText)
-        name.font = .systemFont(ofSize: 13.5, weight: .semibold)
+        let name = NSTextField(labelWithString: service.name)
+        name.font = .systemFont(ofSize: 12.5, weight: service.connected ? .semibold : .medium)
         name.lineBreakMode = .byTruncatingTail
+        name.toolTip = service.name
 
         var detailParts = [service.connected ? "已连接" : (service.enabled ? "未连接" : "已停用")]
         if let ssid = service.ssid { detailParts.append(ssid) }
         if let ip = service.ipAddress { detailParts.append(ip) }
         if let device = service.device { detailParts.append(device) }
         let detail = NSTextField(labelWithString: detailParts.joined(separator: "  ·  "))
-        detail.font = .systemFont(ofSize: 10.5)
+        detail.font = .systemFont(ofSize: 10)
         detail.textColor = service.connected ? accentColor : .secondaryLabelColor
         detail.lineBreakMode = .byTruncatingTail
+        detail.toolTip = detail.stringValue
 
         let traffic = NSTextField(labelWithString: service.connected ? "↓ 正在采样…   ↑ 正在采样…" : "")
-        traffic.font = .monospacedDigitSystemFont(ofSize: 9.5, weight: .regular)
-        traffic.textColor = .tertiaryLabelColor
+        traffic.font = .monospacedDigitSystemFont(ofSize: 10, weight: .regular)
+        traffic.textColor = .secondaryLabelColor
         traffic.isHidden = !service.connected || service.device == nil
         if service.connected, let device = service.device { trafficLabels[device] = traffic }
 
-        let labels = NSStackView(views: [name, detail, traffic])
+        let labels = NSStackView(views: [name, detail])
         labels.orientation = .vertical
         labels.alignment = .leading
-        labels.spacing = 2
+        labels.spacing = 1
         labels.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         let spacer = NSView()
@@ -2484,21 +2445,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         toggle.setAccessibilityLabel("启用 \(service.name)")
 
         let more = serviceActionsButton(service, allServices: allServices)
-        let row = NSStackView(views: [iconView, labels, spacer, toggle, more])
+        var rowViews: [NSView] = [iconView, labels, spacer]
+        if service.isPrimary {
+            rowViews.append(statusPanelBadge("默认", color: accentColor))
+        }
+        rowViews.append(traffic)
+        rowViews.append(toggle)
+        rowViews.append(more)
+        let row = NSStackView(views: rowViews)
         row.orientation = .horizontal
         row.alignment = .centerY
-        row.spacing = 11
+        row.spacing = LinkGlintLayout.standardGap
         row.translatesAutoresizingMaskIntoConstraints = false
         card.contentView?.addSubview(row)
 
         NSLayoutConstraint.activate([
-            card.heightAnchor.constraint(greaterThanOrEqualToConstant: 66),
-            iconView.widthAnchor.constraint(equalToConstant: 25),
-            iconView.heightAnchor.constraint(equalToConstant: 25),
-            row.topAnchor.constraint(equalTo: card.contentView!.topAnchor, constant: 10),
-            row.bottomAnchor.constraint(equalTo: card.contentView!.bottomAnchor, constant: -10),
-            row.leadingAnchor.constraint(equalTo: card.contentView!.leadingAnchor, constant: 13),
-            row.trailingAnchor.constraint(equalTo: card.contentView!.trailingAnchor, constant: -11)
+            card.heightAnchor.constraint(equalToConstant: LinkGlintLayout.mainRowHeight),
+            iconView.widthAnchor.constraint(equalToConstant: 23),
+            iconView.heightAnchor.constraint(equalToConstant: 23),
+            row.topAnchor.constraint(equalTo: card.contentView!.topAnchor, constant: 6),
+            row.bottomAnchor.constraint(equalTo: card.contentView!.bottomAnchor, constant: -6),
+            row.leadingAnchor.constraint(equalTo: card.contentView!.leadingAnchor, constant: 10),
+            row.trailingAnchor.constraint(equalTo: card.contentView!.trailingAnchor, constant: -8)
         ])
         return card
     }
@@ -2509,7 +2477,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         button.controlSize = .small
         button.setAccessibilityLabel("\(service.name) 的更多操作")
         button.translatesAutoresizingMaskIntoConstraints = false
-        button.widthAnchor.constraint(equalToConstant: 34).isActive = true
+        button.widthAnchor.constraint(equalToConstant: 30).isActive = true
         let menu = button.menu!
         menu.removeAllItems()
         let title = NSMenuItem(title: "", action: nil, keyEquivalent: "")

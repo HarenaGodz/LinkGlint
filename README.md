@@ -15,7 +15,9 @@
 LinkGlint 将 Wi‑Fi、有线网络、VPN 和其他网络服务集中到菜单栏，方便查看状态、
 切换网络与处理常用配置。
 
-![LinkGlint 主界面](docs/images/linkglint-3.2.0.png)
+![LinkGlint 主界面](docs/images/linkglint-3.5.0.png)
+
+![LinkGlint 快捷面板](docs/images/linkglint-panel-3.5.0.png)
 
 ## 下载
 
