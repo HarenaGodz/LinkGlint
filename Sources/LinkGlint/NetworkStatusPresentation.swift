@@ -1,5 +1,27 @@
 import Foundation
 
+enum StatusPanelClick: Equatable {
+    case left
+    case right
+}
+
+enum StatusPanelClickAction: Equatable {
+    case openPanel
+    case closePanel
+    case showContextMenu
+}
+
+struct StatusPanelInteraction {
+    static func action(for click: StatusPanelClick, panelIsOpen: Bool) -> StatusPanelClickAction {
+        switch click {
+        case .right:
+            return .showContextMenu
+        case .left:
+            return panelIsOpen ? .closePanel : .openPanel
+        }
+    }
+}
+
 enum MenuBarTrafficIndicatorStyle: String, CaseIterable, Equatable {
     case coloredDots
     case coloredTriangles
@@ -161,6 +183,11 @@ enum TrafficRateFormatter {
         while scaled >= 1_000, unitIndex < units.count - 1 {
             scaled /= 1_000
             unitIndex += 1
+        }
+        // Keep corrupted or synthetic counter spikes inside the fixed menu-bar
+        // geometry instead of creating an arbitrarily wide status item.
+        if unitIndex == units.count - 1, scaled > 999 {
+            scaled = 999
         }
 
         let number: String

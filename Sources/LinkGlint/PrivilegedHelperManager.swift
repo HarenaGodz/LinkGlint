@@ -25,6 +25,9 @@ final class PrivilegedHelperManager {
     static let legacySudoersPath = "/etc/sudoers.d/local_codex_netbar"
 
     private let fileManager: FileManager
+    private let configurationCacheLock = NSLock()
+    private var configurationCache: (path: String?, checkedAt: Date)?
+    private let configurationCacheLifetime: TimeInterval = 30
 
     init(fileManager: FileManager = .default) {
         self.fileManager = fileManager
@@ -80,6 +83,7 @@ final class PrivilegedHelperManager {
             script: script,
             arguments: [source.path, Self.installedHelperPath, Self.sudoersPath, username]
         )
+        invalidateConfigurationCache()
         guard state == .ready else {
             throw NetworkError.commandFailed("权限助手已安装，但免密码验证未通过。请点击“修复权限”重试。")
         }
@@ -99,6 +103,7 @@ final class PrivilegedHelperManager {
                 Self.legacySudoersPath
             ]
         )
+        invalidateConfigurationCache()
     }
 
     func run(_ arguments: [String]) throws {
@@ -108,10 +113,31 @@ final class PrivilegedHelperManager {
         // `-n` explicitly forbids sudo from prompting. After one-time setup this
         // succeeds; if the configuration is damaged, the app reports repair is
         // needed instead of unexpectedly asking for another password.
-        _ = try CommandRunner.run("/usr/bin/sudo", ["-n", helperPath] + arguments)
+        do {
+            _ = try CommandRunner.run("/usr/bin/sudo", ["-n", helperPath] + arguments)
+        } catch {
+            invalidateConfigurationCache()
+            throw error
+        }
     }
 
     private var configuredHelperPath: String? {
+        configurationCacheLock.lock()
+        if let cache = configurationCache,
+           Date().timeIntervalSince(cache.checkedAt) < configurationCacheLifetime {
+            configurationCacheLock.unlock()
+            return cache.path
+        }
+        configurationCacheLock.unlock()
+
+        let resolvedPath = resolveConfiguredHelperPath()
+        configurationCacheLock.lock()
+        configurationCache = (resolvedPath, Date())
+        configurationCacheLock.unlock()
+        return resolvedPath
+    }
+
+    private func resolveConfiguredHelperPath() -> String? {
         let configurations = [
             (Self.installedHelperPath, Self.sudoersPath),
             (Self.legacyInstalledHelperPath, Self.legacySudoersPath)
@@ -126,6 +152,12 @@ final class PrivilegedHelperManager {
             return helperPath
         }
         return nil
+    }
+
+    private func invalidateConfigurationCache() {
+        configurationCacheLock.lock()
+        configurationCache = nil
+        configurationCacheLock.unlock()
     }
 
     private func hasSafeOwnership(path: String) -> Bool {

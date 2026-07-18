@@ -66,7 +66,9 @@ final class TrafficChartView: NSView {
         let fill = NSBezierPath()
         fill.move(to: NSPoint(x: points[0].x, y: rect.maxY))
         points.forEach { fill.line(to: $0) }
-        fill.line(to: NSPoint(x: points.last!.x, y: rect.maxY))
+        if let lastPoint = points.last {
+            fill.line(to: NSPoint(x: lastPoint.x, y: rect.maxY))
+        }
         fill.close()
         color.withAlphaComponent(0.10).setFill()
         fill.fill()
@@ -89,6 +91,6 @@ final class TrafficChartView: NSView {
 
     private var accessibilitySummary: String {
         guard let latest = samples.last else { return "暂无流量数据" }
-        return "下载每秒 \(Int(latest.downloadBytesPerSecond)) 字节，上传每秒 \(Int(latest.uploadBytesPerSecond)) 字节"
+        return "下载 \(TrafficRateFormatter.string(bytesPerSecond: latest.downloadBytesPerSecond, usesBits: false))，上传 \(TrafficRateFormatter.string(bytesPerSecond: latest.uploadBytesPerSecond, usesBits: false))"
     }
 }

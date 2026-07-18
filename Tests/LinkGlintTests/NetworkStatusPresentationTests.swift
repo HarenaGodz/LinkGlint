@@ -2,6 +2,25 @@ import XCTest
 @testable import LinkGlint
 
 final class NetworkStatusPresentationTests: XCTestCase {
+    func testStatusPanelClickInteractionIsDeterministic() {
+        XCTAssertEqual(
+            StatusPanelInteraction.action(for: .left, panelIsOpen: false),
+            .openPanel
+        )
+        XCTAssertEqual(
+            StatusPanelInteraction.action(for: .left, panelIsOpen: true),
+            .closePanel
+        )
+        XCTAssertEqual(
+            StatusPanelInteraction.action(for: .right, panelIsOpen: false),
+            .showContextMenu
+        )
+        XCTAssertEqual(
+            StatusPanelInteraction.action(for: .right, panelIsOpen: true),
+            .showContextMenu
+        )
+    }
+
     func testMenuBarTrafficSupportsSingleAndTwoLineLayouts() {
         XCTAssertEqual(
             MenuBarTrafficPresentation.make(
@@ -123,6 +142,10 @@ final class NetworkStatusPresentationTests: XCTestCase {
         XCTAssertEqual(TrafficRateFormatter.string(bytesPerSecond: 1_250_000, usesBits: false), "1.2 MB/s")
         XCTAssertEqual(TrafficRateFormatter.string(bytesPerSecond: 1_250_000, usesBits: true), "10 Mbps")
         XCTAssertEqual(TrafficRateFormatter.string(bytesPerSecond: .infinity, usesBits: true), "0 bps")
+        XCTAssertEqual(
+            TrafficRateFormatter.string(bytesPerSecond: .greatestFiniteMagnitude, usesBits: true),
+            "999 Tbps"
+        )
     }
 
     func testMenuBarIconFitPreservesWideAndTallAspectRatios() {

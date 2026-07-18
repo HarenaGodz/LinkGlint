@@ -2,6 +2,21 @@ import XCTest
 @testable import LinkGlint
 
 final class NetworkManagerTests: XCTestCase {
+    func testCommandRunnerDrainsLargeOutputWithoutDeadlocking() throws {
+        let output = try CommandRunner.run(
+            "/bin/sh",
+            ["-c", "/usr/bin/head -c 131072 /dev/zero | /usr/bin/tr '\\0' x"]
+        )
+        XCTAssertEqual(output.utf8.count, 131_072)
+    }
+
+    func testCommandRunnerProvidesUsefulMessageForSilentFailure() {
+        XCTAssertThrowsError(try CommandRunner.run("/usr/bin/false")) { error in
+            XCTAssertTrue(error.localizedDescription.contains("false"))
+            XCTAssertTrue(error.localizedDescription.contains("状态"))
+        }
+    }
+
     func testParsesEnabledAndDisabledServices() {
         let input = """
         An asterisk (*) denotes that a network service is disabled.

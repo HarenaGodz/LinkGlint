@@ -188,12 +188,19 @@ enum CommandRunner {
         process.standardOutput = output
         process.standardError = output
         try process.run()
-        process.waitUntilExit()
-
+        // Drain the pipe while the child is running. Waiting first can deadlock
+        // once output fills the kernel pipe buffer.
         let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
         let text = String(data: data, encoding: .utf8) ?? ""
         guard process.terminationStatus == 0 else {
-            throw NetworkError.commandFailed(text.trimmingCharacters(in: .whitespacesAndNewlines))
+            let detail = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let executableName = URL(fileURLWithPath: executable).lastPathComponent
+            throw NetworkError.commandFailed(
+                detail.isEmpty
+                    ? "命令 \(executableName) 执行失败（状态 \(process.terminationStatus)）。"
+                    : detail
+            )
         }
         return text
     }
@@ -227,56 +234,73 @@ final class NetworkManager {
         let priorityByName = Dictionary(uniqueKeysWithValues: configuredOrder.enumerated().map { ($0.element, $0.offset) })
         let primaryDevice = defaultRouteInterface()
 
-        return serviceStates.enumerated().map { fallbackIndex, state in
-            let (name, enabled) = state
-            let priorityIndex = priorityByName[name] ?? (configuredOrder.count + fallbackIndex)
-            let mapping = mappings[name]
-            let info = (try? CommandRunner.run(networksetup, ["-getinfo", name])) ?? ""
-            let ip = parseValue("IP address", in: info).flatMap { value in
-                let lower = value.lowercased()
-                return (lower == "none" || value == "0.0.0.0") ? nil : value
-            }
-            let device = mapping?.device
-            let interface = device.map(interfaceDetails) ?? (active: false, macAddress: nil)
-            let kind = classify(name: name, hardwarePort: mapping?.port)
-            let wifiPower: Bool?
-            let ssid: String?
-            if kind == .wifi, let device {
-                let output = try? CommandRunner.run(networksetup, ["-getairportpower", device])
-                wifiPower = output.map { $0.localizedCaseInsensitiveContains(": On") }
-                if wifiPower == true {
-                    let networkOutput = try? CommandRunner.run(networksetup, ["-getairportnetwork", device])
-                    ssid = networkOutput.flatMap(parseCurrentWiFiNetwork)
+        // `networksetup` exposes per-service details through separate commands.
+        // Read independent services concurrently so machines with many adapters
+        // do not pay the full subprocess latency serially on every refresh.
+        var resolvedServices = Array<NetworkService?>(repeating: nil, count: serviceStates.count)
+        let resultLock = NSLock()
+        let detailQueue = OperationQueue()
+        detailQueue.name = "io.github.harenagodz.LinkGlint.service-details"
+        detailQueue.qualityOfService = .utility
+        detailQueue.maxConcurrentOperationCount = min(max(serviceStates.count, 1), 4)
+
+        for (fallbackIndex, state) in serviceStates.enumerated() {
+            detailQueue.addOperation { [self] in
+                let (name, enabled) = state
+                let priorityIndex = priorityByName[name] ?? (configuredOrder.count + fallbackIndex)
+                let mapping = mappings[name]
+                let info = (try? CommandRunner.run(networksetup, ["-getinfo", name])) ?? ""
+                let ip = parseValue("IP address", in: info).flatMap { value in
+                    let lower = value.lowercased()
+                    return (lower == "none" || value == "0.0.0.0") ? nil : value
+                }
+                let device = mapping?.device
+                let interface = device.map(interfaceDetails) ?? (active: false, macAddress: nil)
+                let kind = classify(name: name, hardwarePort: mapping?.port)
+                let wifiPower: Bool?
+                let ssid: String?
+                if kind == .wifi, let device {
+                    let output = try? CommandRunner.run(networksetup, ["-getairportpower", device])
+                    wifiPower = output.map { $0.localizedCaseInsensitiveContains(": On") }
+                    if wifiPower == true {
+                        let networkOutput = try? CommandRunner.run(networksetup, ["-getairportnetwork", device])
+                        ssid = networkOutput.flatMap(parseCurrentWiFiNetwork)
+                    } else {
+                        // `-getairportnetwork` can wait several seconds while the radio
+                        // is off, so skip it for a much faster initial refresh.
+                        ssid = nil
+                    }
                 } else {
-                    // `-getairportnetwork` can wait several seconds while the radio
-                    // is off, so skip it for a much faster initial refresh.
+                    wifiPower = nil
                     ssid = nil
                 }
-            } else {
-                wifiPower = nil
-                ssid = nil
+
+                let dnsOutput = (try? CommandRunner.run(networksetup, ["-getdnsservers", name])) ?? ""
+
+                let service = NetworkService(
+                    name: name,
+                    orderIndex: priorityIndex,
+                    hardwarePort: mapping?.port,
+                    device: device,
+                    enabled: enabled,
+                    connected: enabled && interface.active && ip != nil,
+                    ipAddress: ip,
+                    subnetMask: parseValue("Subnet mask", in: info),
+                    router: parseValue("Router", in: info).flatMap(validNetworkValue),
+                    dnsServers: parseDNSServers(dnsOutput),
+                    macAddress: interface.macAddress,
+                    ssid: ssid,
+                    isPrimary: device != nil && device == primaryDevice,
+                    kind: kind,
+                    wifiPowered: wifiPower
+                )
+                resultLock.lock()
+                resolvedServices[fallbackIndex] = service
+                resultLock.unlock()
             }
-
-            let dnsOutput = (try? CommandRunner.run(networksetup, ["-getdnsservers", name])) ?? ""
-
-            return NetworkService(
-                name: name,
-                orderIndex: priorityIndex,
-                hardwarePort: mapping?.port,
-                device: device,
-                enabled: enabled,
-                connected: enabled && interface.active && ip != nil,
-                ipAddress: ip,
-                subnetMask: parseValue("Subnet mask", in: info),
-                router: parseValue("Router", in: info).flatMap(validNetworkValue),
-                dnsServers: parseDNSServers(dnsOutput),
-                macAddress: interface.macAddress,
-                ssid: ssid,
-                isPrimary: device != nil && device == primaryDevice,
-                kind: kind,
-                wifiPowered: wifiPower
-            )
-        }.sorted { $0.orderIndex < $1.orderIndex }
+        }
+        detailQueue.waitUntilAllOperationsAreFinished()
+        return resolvedServices.compactMap { $0 }.sorted { $0.orderIndex < $1.orderIndex }
     }
 
     func fetchTrafficCounters() throws -> [String: InterfaceCounters] {

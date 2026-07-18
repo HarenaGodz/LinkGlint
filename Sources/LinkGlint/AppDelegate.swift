@@ -21,6 +21,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
     private var statusItem: NSStatusItem!
     private let statusPopover = NSPopover()
     private var statusContextMenu: NSMenu?
+    private var statusPanelIsOpen = false
+    private var statusPanelLocalEventMonitor: Any?
+    private var statusPanelGlobalEventMonitor: Any?
+    private var statusPanelResignObserver: NSObjectProtocol?
     private var statusPanelServicesSnapshot: [NetworkService]?
     private weak var statusPanelUsageLabel: NSTextField?
     private weak var statusPanelSummaryLabel: NSTextField?
@@ -54,9 +58,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
     private var isRefreshing = false
     private var isPerformingPrivilegedChange = false
     private var isApplyingServiceSwitch = false
+    private var isConfiguringPrivilegedAccess = false
     private var networkStateGeneration = 0
     private var isSamplingTraffic = false
     private var isDiagnosing = false
+    private var privilegedAccessState: PrivilegedAccessState = .notConfigured
     private var lastServices: [NetworkService] = []
     private var renderedWindowServices: [NetworkService]?
     private var lastDiagnostic: NetworkDiagnostic?
@@ -88,11 +94,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         // app when a system symbol is unavailable or hard to spot among many items.
         applyMenuBarAppearance()
         statusItem.button?.toolTip = "LinkGlint 网络管理"
+        statusItem.button?.setAccessibilityHelp("单击打开快捷面板，右击打开完整功能菜单")
+        statusItem.button?.setAccessibilityExpanded(false)
         statusItem.button?.target = self
         statusItem.button?.action = #selector(toggleStatusPanel(_:))
         statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
-        statusPopover.behavior = .transient
-        statusPopover.animates = true
+        // The status button owns the complete open/close cycle. A transient
+        // popover closes on mouse-down, while NSStatusBarButton acts on
+        // mouse-up; combining both can immediately reopen a panel the user
+        // just tried to close.
+        statusPopover.behavior = .applicationDefined
+        statusPopover.animates = false
         statusPopover.delegate = self
 
         createMainWindow()
@@ -101,9 +113,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
             showMainWindow()
         }
         performRefresh(showingErrors: false)
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 12, repeats: true) { [weak self] _ in
+        let refreshTimer = Timer(timeInterval: 12, repeats: true) { [weak self] _ in
             self?.performRefresh(showingErrors: false)
         }
+        self.refreshTimer = refreshTimer
+        RunLoop.main.add(refreshTimer, forMode: .common)
         scheduleTrafficTimer()
         pathMonitor.pathUpdateHandler = { [weak self] _ in
             DispatchQueue.main.async {
@@ -118,6 +132,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         trafficTimer?.invalidate()
         pendingPathRefresh?.cancel()
         pathMonitor.cancel()
+        removeStatusPanelDismissalMonitors()
         usageTracker.flush()
     }
 
@@ -197,7 +212,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
     }
 
     private func performRefresh(showingErrors: Bool) {
-        guard !isRefreshing, !isApplyingServiceSwitch, !isPerformingPrivilegedChange else { return }
+        guard !isRefreshing,
+              !isApplyingServiceSwitch,
+              !isPerformingPrivilegedChange,
+              !isConfiguringPrivilegedAccess else { return }
         isRefreshing = true
         let generation = networkStateGeneration
 
@@ -205,6 +223,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
             guard let self else { return }
             do {
                 let services = try self.manager.fetchServices()
+                let accessState = self.manager.privilegedAccessState
                 DispatchQueue.main.async {
                     self.isRefreshing = false
                     guard generation == self.networkStateGeneration else {
@@ -215,8 +234,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
                     }
                     self.hasLoadedNetworkState = true
                     let servicesChanged = services != self.lastServices
+                    let accessStateChanged = accessState != self.privilegedAccessState
+                    self.privilegedAccessState = accessState
+                    if accessStateChanged {
+                        self.updatePrivilegedAccessControls()
+                    }
                     self.lastServices = services
-                    if servicesChanged {
+                    if servicesChanged || accessStateChanged {
                         self.rebuildMenu(with: services)
                         if self.mainWindow?.isVisible == true {
                             self.rebuildWindow(with: services)
@@ -231,6 +255,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
             } catch {
                 DispatchQueue.main.async {
                     self.isRefreshing = false
+                    guard generation == self.networkStateGeneration else {
+                        if !self.isApplyingServiceSwitch, !self.isPerformingPrivilegedChange {
+                            self.performRefresh(showingErrors: showingErrors)
+                        }
+                        return
+                    }
                     if showingErrors {
                         self.showError(error)
                     } else {
@@ -485,7 +515,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         settings.target = self
         settingsMenu.addItem(settings)
 
-        let accessReady = manager.privilegedAccessState == .ready
+        let accessReady = privilegedAccessState == .ready
         let accessItem = NSMenuItem(
             title: accessReady ? "免密码网络切换：已启用" : "配置免密码网络切换…",
             action: #selector(showPrivilegedAccessSetup),
@@ -540,23 +570,99 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
 
     @objc private func toggleStatusPanel(_ sender: Any?) {
         guard let button = statusItem.button else { return }
-        if NSApp.currentEvent?.type == .rightMouseUp {
-            statusPopover.close()
+        let click: StatusPanelClick = NSApp.currentEvent?.type == .rightMouseUp ? .right : .left
+        switch StatusPanelInteraction.action(for: click, panelIsOpen: statusPanelIsOpen) {
+        case .showContextMenu:
+            closeStatusPanel()
+            button.highlight(true)
             statusContextMenu?.popUp(
                 positioning: nil,
                 at: NSPoint(x: 0, y: button.bounds.height + 3),
                 in: button
             )
+            button.highlight(false)
+        case .closePanel:
+            closeStatusPanel()
+        case .openPanel:
+            openStatusPanel(relativeTo: button)
+        }
+    }
+
+    private func openStatusPanel(relativeTo button: NSStatusBarButton) {
+        guard !statusPanelIsOpen else { return }
+        if statusPopover.contentViewController == nil || statusPanelServicesSnapshot != lastServices {
+            rebuildStatusPanel(with: lastServices)
+        }
+        statusPanelIsOpen = true
+        button.highlight(true)
+        button.setAccessibilityExpanded(true)
+        statusPopover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        updateUsageDisplay()
+        installStatusPanelDismissalMonitors()
+    }
+
+    private func closeStatusPanel() {
+        guard statusPanelIsOpen || statusPopover.isShown else {
+            removeStatusPanelDismissalMonitors()
             return
         }
-        if statusPopover.isShown {
-            statusPopover.performClose(sender)
-        } else {
-            if statusPopover.contentViewController == nil || statusPanelServicesSnapshot != lastServices {
-                rebuildStatusPanel(with: lastServices)
+        statusPanelIsOpen = false
+        statusItem.button?.highlight(false)
+        statusItem.button?.setAccessibilityExpanded(false)
+        removeStatusPanelDismissalMonitors()
+        statusPopover.performClose(nil)
+    }
+
+    private func installStatusPanelDismissalMonitors() {
+        removeStatusPanelDismissalMonitors()
+        statusPanelLocalEventMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown]
+        ) { [weak self] event in
+            guard let self else { return event }
+            // Events without a window include status-item interactions. Let the
+            // button's mouse-up action perform the toggle instead of racing it.
+            guard let eventWindow = event.window else { return event }
+            if eventWindow === self.statusPopover.contentViewController?.view.window
+                || eventWindow.level == .popUpMenu
+                || self.eventIsInsideStatusButton(event) {
+                return event
             }
-            statusPopover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-            updateUsageDisplay()
+            self.closeStatusPanel()
+            return event
+        }
+        statusPanelGlobalEventMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown]
+        ) { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.closeStatusPanel()
+            }
+        }
+        statusPanelResignObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didResignActiveNotification,
+            object: NSApp,
+            queue: .main
+        ) { [weak self] _ in
+            self?.closeStatusPanel()
+        }
+    }
+
+    private func eventIsInsideStatusButton(_ event: NSEvent) -> Bool {
+        guard let button = statusItem.button, event.window === button.window else { return false }
+        return button.bounds.contains(button.convert(event.locationInWindow, from: nil))
+    }
+
+    private func removeStatusPanelDismissalMonitors() {
+        if let monitor = statusPanelLocalEventMonitor {
+            NSEvent.removeMonitor(monitor)
+            statusPanelLocalEventMonitor = nil
+        }
+        if let monitor = statusPanelGlobalEventMonitor {
+            NSEvent.removeMonitor(monitor)
+            statusPanelGlobalEventMonitor = nil
+        }
+        if let observer = statusPanelResignObserver {
+            NotificationCenter.default.removeObserver(observer)
+            statusPanelResignObserver = nil
         }
     }
 
@@ -566,7 +672,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         let visibleRows = min(max(services.count, 1), 5)
         let rowViewportHeight = CGFloat(visibleRows) * LinkGlintLayout.panelRowHeight
             + CGFloat(max(visibleRows - 1, 0)) * LinkGlintLayout.compactGap
-        let permissionHeight: CGFloat = manager.privilegedAccessState == .ready ? 0 : 30
+        let permissionHeight: CGFloat = privilegedAccessState == .ready ? 0 : 30
         let height: CGFloat = 214 + permissionHeight + rowViewportHeight
         let controller = NSViewController()
         // NSPopover already supplies the window shape and shadow. A second
@@ -867,7 +973,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         actions.spacing = LinkGlintLayout.compactGap
 
         var footerViews: [NSView] = []
-        if manager.privilegedAccessState != .ready {
+        if privilegedAccessState != .ready {
             let permission = NSTextField(labelWithString: "部分操作需要更新网络权限")
             permission.font = .systemFont(ofSize: 10.5, weight: .medium)
             permission.textColor = .systemOrange
@@ -1026,8 +1132,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
                         uploadBytesPerSecond: self.currentUploadBytesPerSecond,
                         at: sampleDate
                     )
-                    self.statusPanelTrafficRatesLabel?.attributedStringValue = self.statusPanelTrafficRateText
-                    self.statusPanelTrafficChart?.samples = self.trafficRateHistory.samples
+                    if self.statusPanelIsOpen {
+                        self.statusPanelTrafficRatesLabel?.attributedStringValue = self.statusPanelTrafficRateText
+                        self.statusPanelTrafficChart?.samples = self.trafficRateHistory.samples
+                    }
                     self.updateUsageDisplay()
                     self.applyMenuBarAppearance()
                 }
@@ -1043,9 +1151,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
 
     private func scheduleTrafficTimer() {
         trafficTimer?.invalidate()
-        trafficTimer = Timer.scheduledTimer(withTimeInterval: preferences.trafficRefreshInterval, repeats: true) { [weak self] _ in
+        let trafficTimer = Timer(timeInterval: preferences.trafficRefreshInterval, repeats: true) { [weak self] _ in
             self?.sampleTraffic()
         }
+        self.trafficTimer = trafficTimer
+        RunLoop.main.add(trafficTimer, forMode: .common)
     }
 
     private func formatBytes(_ bytes: UInt64) -> String {
@@ -1345,6 +1455,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         return result
     }
 
+    func popoverWillClose(_ notification: Notification) {
+        statusPanelIsOpen = false
+        statusItem.button?.highlight(false)
+        statusItem.button?.setAccessibilityExpanded(false)
+        removeStatusPanelDismissalMonitors()
+    }
+
     func popoverDidClose(_ notification: Notification) {
         lastMenuBarRenderKey = nil
         lastRenderedMenuBarPresentation = nil
@@ -1561,7 +1678,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
     }
 
     private func updateNetworkControlAvailability() {
-        let enabled = !isPerformingPrivilegedChange && !isApplyingServiceSwitch
+        let enabled = !isPerformingPrivilegedChange
+            && !isApplyingServiceSwitch
+            && !isConfiguringPrivilegedAccess
         setNetworkControlAvailability(in: mainWindow?.contentView, enabled: enabled)
         setNetworkControlAvailability(in: statusPopover.contentViewController?.view, enabled: enabled)
     }
@@ -1637,7 +1756,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         optimisticServices: [NetworkService]? = nil,
         operation: @escaping () throws -> Void
     ) {
-        guard manager.privilegedAccessState == .ready else {
+        guard privilegedAccessState == .ready else {
             configurePrivilegedAccess { [weak self] in
                 self?.performPrivilegedChange(
                     description: description,
@@ -1647,7 +1766,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
             }
             return
         }
-        guard !isPerformingPrivilegedChange, !isApplyingServiceSwitch else { return }
+        guard !isPerformingPrivilegedChange,
+              !isApplyingServiceSwitch,
+              !isConfiguringPrivilegedAccess else { return }
 
         isPerformingPrivilegedChange = true
         let rollbackServices = lastServices
@@ -1686,13 +1807,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
     }
 
     private func performServiceSwitch(target: String, otherServices: [String], wifiDevice: String?) {
-        guard manager.privilegedAccessState == .ready else {
+        guard privilegedAccessState == .ready else {
             configurePrivilegedAccess { [weak self] in
                 self?.performServiceSwitch(target: target, otherServices: otherServices, wifiDevice: wifiDevice)
             }
             return
         }
-        guard !isApplyingServiceSwitch, !isPerformingPrivilegedChange else { return }
+        guard !isApplyingServiceSwitch,
+              !isPerformingPrivilegedChange,
+              !isConfiguringPrivilegedAccess else { return }
 
         isApplyingServiceSwitch = true
         let rollbackServices = lastServices
@@ -1746,7 +1869,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
     }
 
     private func configurePrivilegedAccess(afterConfiguration: (() -> Void)?) {
+        guard !isConfiguringPrivilegedAccess else { return }
         let currentState = manager.privilegedAccessState
+        privilegedAccessState = currentState
         if currentState == .ready {
             let alert = NSAlert()
             alert.messageText = "免密码网络切换已启用"
@@ -1769,26 +1894,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
 
         accessStatusLabel?.stringValue = "正在等待 macOS 完成一次管理员授权…"
         accessActionButton?.isEnabled = false
-        do {
-            try manager.configurePrivilegedAccess()
-            updatePrivilegedAccessControls()
-            if !lastServices.isEmpty { rebuildMenu(with: lastServices) }
+        isConfiguringPrivilegedAccess = true
+        updateNetworkControlAvailability()
+        updatePrivilegedAccessControls()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let result: Result<PrivilegedAccessState, Error>
+            do {
+                try self.manager.configurePrivilegedAccess()
+                result = .success(self.manager.privilegedAccessState)
+            } catch {
+                result = .failure(error)
+            }
+            DispatchQueue.main.async {
+                self.isConfiguringPrivilegedAccess = false
+                switch result {
+                case .success(let state):
+                    self.privilegedAccessState = state
+                    self.updatePrivilegedAccessControls()
+                    if !self.lastServices.isEmpty { self.rebuildMenu(with: self.lastServices) }
 
-            let success = NSAlert()
-            success.alertStyle = .informational
-            success.messageText = "配置完成"
-            success.informativeText = "之后启用、停用或切换网络将直接执行，不再显示密码窗口。登录时启动也会沿用此配置。"
-            success.addButton(withTitle: "完成")
-            success.runModal()
-            afterConfiguration?()
-        } catch {
-            updatePrivilegedAccessControls()
-            showError(error)
+                    let success = NSAlert()
+                    success.alertStyle = .informational
+                    success.messageText = "配置完成"
+                    success.informativeText = "之后启用、停用或切换网络将直接执行，不再显示密码窗口。登录时启动也会沿用此配置。"
+                    success.addButton(withTitle: "完成")
+                    success.runModal()
+                    afterConfiguration?()
+                case .failure(let error):
+                    self.privilegedAccessState = self.manager.privilegedAccessState
+                    self.updatePrivilegedAccessControls()
+                    self.showError(error)
+                }
+            }
         }
     }
 
     @objc private func removePrivilegedAccess() {
-        guard manager.privilegedAccessState != .notConfigured else { return }
+        let currentState = manager.privilegedAccessState
+        privilegedAccessState = currentState
+        guard currentState != .notConfigured else { return }
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "移除免密码网络权限？"
@@ -1798,17 +1943,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         alert.addButton(withTitle: "取消")
         NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        do {
-            try manager.removePrivilegedAccess()
-            updatePrivilegedAccessControls()
-            if !lastServices.isEmpty { rebuildMenu(with: lastServices) }
-        } catch {
-            showError(error)
+        isConfiguringPrivilegedAccess = true
+        updateNetworkControlAvailability()
+        updatePrivilegedAccessControls()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let result: Result<PrivilegedAccessState, Error>
+            do {
+                try self.manager.removePrivilegedAccess()
+                result = .success(self.manager.privilegedAccessState)
+            } catch {
+                result = .failure(error)
+            }
+            DispatchQueue.main.async {
+                self.isConfiguringPrivilegedAccess = false
+                switch result {
+                case .success(let state):
+                    self.privilegedAccessState = state
+                    self.updatePrivilegedAccessControls()
+                    if !self.lastServices.isEmpty { self.rebuildMenu(with: self.lastServices) }
+                case .failure(let error):
+                    self.privilegedAccessState = self.manager.privilegedAccessState
+                    self.updatePrivilegedAccessControls()
+                    self.showError(error)
+                }
+            }
         }
     }
 
     private func updatePrivilegedAccessControls() {
-        let state = manager.privilegedAccessState
+        let state = privilegedAccessState
         accessStatusLabel?.stringValue = state.title
         privilegePreferenceLabel?.stringValue = state.title
 
@@ -1850,6 +2014,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
             privilegePreferenceButton?.isEnabled = true
             removePrivilegeButton?.isEnabled = true
         }
+        if isConfiguringPrivilegedAccess {
+            accessStatusLabel?.stringValue = "正在等待 macOS 完成管理员授权…"
+            privilegePreferenceLabel?.stringValue = "正在更新网络权限…"
+            accessActionButton?.isEnabled = false
+            privilegePreferenceButton?.isEnabled = false
+            removePrivilegeButton?.isEnabled = false
+        }
+        updateNetworkControlAvailability()
     }
 
     @objc private func openNetworkSettings() {
@@ -2245,7 +2417,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         shield.contentTintColor = .systemBlue
         shield.symbolConfiguration = .init(pointSize: 18, weight: .medium)
         shield.translatesAutoresizingMaskIntoConstraints = false
-        privilegePreferenceLabel = NSTextField(labelWithString: manager.privilegedAccessState.title)
+        privilegePreferenceLabel = NSTextField(labelWithString: privilegedAccessState.title)
         privilegePreferenceLabel?.font = .systemFont(ofSize: 12, weight: .medium)
         let privilegeSpacer = NSView()
         privilegeSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
