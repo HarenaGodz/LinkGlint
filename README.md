@@ -16,7 +16,14 @@
 
 <p align="center">
   LinkGlint 是一款轻量、原生的 macOS 菜单栏网络管理工具。<br>
-  它将 Wi‑Fi、有线网络、VPN 和其他网络服务集中到一个紧凑面板中。
+  它将连接状态、实时流量、Wi‑Fi、有线网络与网络服务优先级集中到一个紧凑面板中。
+</p>
+
+<p align="center">
+  <a href="https://github.com/HarenaGodz/LinkGlint/releases/latest"><strong>下载最新版</strong></a>
+  · <a href="CHANGELOG.md">更新日志</a>
+  · <a href="docs/ARCHITECTURE.md">架构说明</a>
+  · <a href="https://github.com/HarenaGodz/LinkGlint/issues">问题反馈</a>
 </p>
 
 <table>
@@ -34,16 +41,19 @@
 
 - **状态一眼可见**：菜单栏显示网络名称和实时上下行速度，支持单行、双行、Byte/s 与 bit/s。
 - **流量趋势清晰**：快捷面板绘制最近 60 次采样的下载、上传曲线，低流量和突发峰值均可辨认。
-- **常用操作集中**：直接启停或切换服务，连接 Wi‑Fi、修改 DNS、重命名服务和调整优先级。
+- **附近 Wi‑Fi 可选择**：直接扫描网络，查看信号与加密状态；已保存网络可留空密码连接。
+- **常用操作集中**：启停或切换服务，修改 DNS、重命名服务和调整优先级，无需反复打开系统设置。
 - **复杂配置可复用**：保存网络方案，快速切换仅 Wi‑Fi、仅有线或自定义服务组合。
 - **操作反馈可靠**：停用当前连接前确认，修改过程即时反馈，失败时恢复界面状态。
 - **原生且克制**：使用 AppKit 与 macOS 原生登录项；关闭主窗口后继续安静驻留菜单栏。
 
 ## 下载与安装
 
-1. 从 [GitHub Releases](https://github.com/HarenaGodz/LinkGlint/releases/latest) 下载最新的 macOS 通用版本。
-2. 解压后将 `LinkGlint.app` 移入“应用程序”文件夹。
-3. 启动 LinkGlint；如 macOS 首次阻止打开，请在访达中右击应用并选择“打开”。
+1. 从 [GitHub Releases](https://github.com/HarenaGodz/LinkGlint/releases/latest) 下载 `LinkGlint-*-macOS-universal.zip`。
+2. 解压并将 `LinkGlint.app` 拖入“应用程序”文件夹。
+3. 首次启动时，如 macOS 阻止打开，请在访达中右击应用并选择“打开”。
+
+> Release 同时支持 Apple Silicon 与 Intel。校验文件可在对应 Release 的 Assets 中下载。
 
 | 项目 | 要求 |
 | --- | --- |
@@ -53,6 +63,9 @@
 | 许可证 | MIT |
 
 ## 快速使用
+
+启动后，LinkGlint 会驻留在菜单栏：**左击处理高频操作，右击进入完整功能**。主窗口可以随时
+关闭，不影响菜单栏状态、网速采样和自动刷新。
 
 | 操作 | 结果 |
 | --- | --- |
@@ -64,8 +77,8 @@
 | 打开“调整服务优先级” | 拖动服务并应用新的系统优先顺序 |
 | 打开“偏好设置” | 调整显示内容、网速单位、布局、标记样式和刷新间隔 |
 
-菜单栏网速标记提供三种样式：**蓝橙圆点**、**彩色方向三角**和**经典上下箭头**。
-状态栏名称、标记位置及数字区域经过固定布局处理，速率变化时不会带动项目左右晃动。
+菜单栏网速标记提供 **蓝橙圆点**、**彩色方向三角**和**经典上下箭头** 三种样式。网络名称、
+标记位置和数字区域采用稳定布局，速率变化时不会带动状态项左右晃动。
 
 ## 功能概览
 
@@ -95,19 +108,20 @@
 
 ## 权限与本地数据
 
-读取网络状态和实时流量不需要管理员权限。首次修改系统网络配置时，LinkGlint 会请求一次
-管理员授权并安装受限助手；助手由 `root` 持有，只接受项目中定义的固定网络操作，不接收
-任意 Shell 命令或可执行文件路径。
+| 权限 | 何时出现 | 用途 |
+| --- | --- | --- |
+| 无额外权限 | 查看状态、流量和诊断 | 只读取本机网络接口信息 |
+| 定位服务 | 首次浏览附近 Wi‑Fi | macOS 用它保护附近无线网络名称；LinkGlint 不读取、保存或上传坐标 |
+| 管理员授权 | 首次修改系统网络配置 | 安装受限助手，执行启停、切换、连接、DNS 和优先级操作 |
 
-首次浏览附近 Wi-Fi 时，macOS 会请求定位服务权限，这是系统用于保护附近无线网络名称的隐私
-要求；LinkGlint 只将该权限用于本机 Wi-Fi 扫描，不会保存或上传位置。即使不授予权限，也可在
-次级面板中选择“其他网络…”并手动输入 SSID。
+受限助手由 `root` 持有，只接受项目中定义的固定网络操作，不接收任意 Shell 命令或可执行文件
+路径。不授予定位权限时，仍可在次级面板中选择“其他网络…”并手动输入 SSID。
 
 偏好设置、网络方案和流量用量记录保存在当前用户的本地 `UserDefaults` 中。项目没有集成账号
 系统或遥测 SDK。面板中的“今日记录”是 **LinkGlint 运行期间的本地累计值**，并非 macOS
 全系统历史流量账单；实时曲线保留最近 60 次采样，实际覆盖时长随刷新间隔变化。
 
-更多实现说明见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
+更多实现与权限边界说明见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
 
 ## 从源码构建
 
@@ -160,6 +174,13 @@ scripts/verify.sh          测试、构建及签名验证
 </details>
 
 <details>
+<summary><strong>为什么浏览附近 Wi‑Fi 需要定位权限？</strong></summary>
+
+这是 macOS 对附近无线网络名称的隐私保护要求。LinkGlint 只调用 CoreWLAN 在本机扫描网络，不会
+读取坐标，也没有账号系统或遥测服务。不授权时仍可手动输入 SSID。
+</details>
+
+<details>
 <summary><strong>为什么修改网络时需要管理员权限？</strong></summary>
 
 macOS 要求以管理员权限修改网络服务、DNS 和优先级。LinkGlint 只在首次安装或更新受限助手时
@@ -168,7 +189,8 @@ macOS 要求以管理员权限修改网络服务、DNS 和优先级。LinkGlint 
 
 ## 参与项目
 
-欢迎提交 [Issue](https://github.com/HarenaGodz/LinkGlint/issues) 或 Pull Request。提交代码前请运行：
+欢迎提交 [Issue](https://github.com/HarenaGodz/LinkGlint/issues) 或 Pull Request。建议先说明使用的
+macOS 版本、处理器架构和复现步骤。提交代码前请运行：
 
 ```bash
 swift test
