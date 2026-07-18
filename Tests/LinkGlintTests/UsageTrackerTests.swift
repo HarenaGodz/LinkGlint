@@ -81,6 +81,30 @@ final class UsageTrackerTests: XCTestCase {
         XCTAssertEqual(AppPreferences(defaults: defaults).trafficRefreshInterval, 5)
     }
 
+    func testTrafficRateHistoryKeepsNewestSamplesWithinCapacity() {
+        var history = TrafficRateHistory(capacity: 3)
+        for value in 1...4 {
+            history.append(
+                downloadBytesPerSecond: Double(value),
+                uploadBytesPerSecond: Double(value * 10),
+                at: Date(timeIntervalSince1970: Double(value))
+            )
+        }
+
+        XCTAssertEqual(history.samples.count, 3)
+        XCTAssertEqual(history.samples.map(\.downloadBytesPerSecond), [2, 3, 4])
+        XCTAssertEqual(history.peakBytesPerSecond, 40)
+    }
+
+    func testTrafficRateHistorySanitizesInvalidRates() {
+        var history = TrafficRateHistory(capacity: 2)
+        history.append(downloadBytesPerSecond: -.infinity, uploadBytesPerSecond: .nan)
+
+        XCTAssertEqual(history.samples.first?.downloadBytesPerSecond, 0)
+        XCTAssertEqual(history.samples.first?.uploadBytesPerSecond, 0)
+        XCTAssertEqual(history.peakBytesPerSecond, 1)
+    }
+
     private func makeDate(_ year: Int, _ month: Int, _ day: Int) -> Date {
         calendar.date(from: DateComponents(year: year, month: month, day: day, hour: 12))!
     }

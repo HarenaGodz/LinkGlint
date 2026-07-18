@@ -24,6 +24,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
     private var statusPanelServicesSnapshot: [NetworkService]?
     private weak var statusPanelUsageLabel: NSTextField?
     private weak var statusPanelSummaryLabel: NSTextField?
+    private weak var statusPanelTrafficRatesLabel: NSTextField?
+    private weak var statusPanelTrafficChart: TrafficChartView?
     private weak var statusContextUsageItem: NSMenuItem?
     private weak var statusContextLoginItem: NSMenuItem?
     private var mainWindow: NSWindow!
@@ -62,6 +64,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
     private var previousTrafficSampleDate: Date?
     private var currentDownloadBytesPerSecond: Double = 0
     private var currentUploadBytesPerSecond: Double = 0
+    private var trafficRateHistory = TrafficRateHistory(capacity: 60)
     private var lastMenuBarRenderKey: String?
     private var lastRenderedMenuBarPresentation: MenuBarTrafficPresentation?
     private var trafficLabels: [String: NSTextField] = [:]
@@ -564,7 +567,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         let rowViewportHeight = CGFloat(visibleRows) * LinkGlintLayout.panelRowHeight
             + CGFloat(max(visibleRows - 1, 0)) * LinkGlintLayout.compactGap
         let permissionHeight: CGFloat = manager.privilegedAccessState == .ready ? 0 : 30
-        let height: CGFloat = 128 + permissionHeight + rowViewportHeight
+        let height: CGFloat = 214 + permissionHeight + rowViewportHeight
         let controller = NSViewController()
         // NSPopover already supplies the window shape and shadow. A second
         // vibrancy layer here used to blend strongly with colorful wallpapers,
@@ -646,8 +649,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
             rows.bottomAnchor.constraint(equalTo: document.bottomAnchor)
         ])
 
+        let trafficChart = statusPanelTrafficChartCard()
         let footer = statusPanelFooter(services: services)
-        let stack = NSStackView(views: [brandHeader, sectionHeader, scroll, footer])
+        let stack = NSStackView(views: [brandHeader, sectionHeader, scroll, trafficChart, footer])
         stack.orientation = .vertical
         stack.alignment = .width
         stack.spacing = 6
@@ -663,6 +667,82 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         statusPopover.contentViewController = controller
         statusPopover.contentSize = NSSize(width: width, height: height)
         updateOperationFeedbackDisplays()
+    }
+
+    private func statusPanelTrafficChartCard() -> NSView {
+        let title = NSTextField(labelWithString: "实时流量")
+        title.font = .systemFont(ofSize: 10.5, weight: .semibold)
+        title.textColor = .secondaryLabelColor
+
+        let range = NSTextField(labelWithString: "最近 60 次")
+        range.font = .systemFont(ofSize: 9.5)
+        range.textColor = .tertiaryLabelColor
+
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        let rates = NSTextField(labelWithAttributedString: statusPanelTrafficRateText)
+        rates.font = .monospacedDigitSystemFont(ofSize: 9.5, weight: .medium)
+        rates.alignment = .right
+        rates.lineBreakMode = .byClipping
+        rates.textColor = .secondaryLabelColor
+        rates.translatesAutoresizingMaskIntoConstraints = false
+        rates.widthAnchor.constraint(equalToConstant: 180).isActive = true
+        rates.toolTip = "蓝色为下载，橙色为上传"
+        statusPanelTrafficRatesLabel = rates
+
+        let header = NSStackView(views: [title, range, spacer, rates])
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = LinkGlintLayout.compactGap
+
+        let chart = TrafficChartView()
+        chart.samples = trafficRateHistory.samples
+        chart.translatesAutoresizingMaskIntoConstraints = false
+        statusPanelTrafficChart = chart
+
+        let content = NSStackView(views: [header, chart])
+        content.orientation = .vertical
+        content.alignment = .width
+        content.spacing = 2
+        content.edgeInsets = NSEdgeInsets(top: 7, left: 8, bottom: 5, right: 8)
+        content.translatesAutoresizingMaskIntoConstraints = false
+
+        let card = NSBox()
+        card.boxType = .custom
+        card.cornerRadius = LinkGlintLayout.rowRadius
+        card.borderWidth = 1
+        card.borderColor = NSColor.separatorColor.withAlphaComponent(0.28)
+        card.fillColor = NSColor.controlBackgroundColor.withAlphaComponent(0.20)
+        card.contentView?.addSubview(content)
+        NSLayoutConstraint.activate([
+            card.heightAnchor.constraint(equalToConstant: 80),
+            content.topAnchor.constraint(equalTo: card.contentView!.topAnchor),
+            content.leadingAnchor.constraint(equalTo: card.contentView!.leadingAnchor),
+            content.trailingAnchor.constraint(equalTo: card.contentView!.trailingAnchor),
+            content.bottomAnchor.constraint(equalTo: card.contentView!.bottomAnchor),
+            chart.heightAnchor.constraint(equalToConstant: 46)
+        ])
+        return card
+    }
+
+    private var statusPanelTrafficRateText: NSAttributedString {
+        let download = "● ↓ \(formatRate(currentDownloadBytesPerSecond))"
+        let upload = "● ↑ \(formatRate(currentUploadBytesPerSecond))"
+        let result = NSMutableAttributedString(
+            string: "\(download)   \(upload)",
+            attributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .medium),
+                .foregroundColor: NSColor.secondaryLabelColor
+            ]
+        )
+        result.addAttribute(.foregroundColor, value: NSColor.systemBlue, range: NSRange(location: 0, length: 1))
+        result.addAttribute(
+            .foregroundColor,
+            value: NSColor.systemOrange,
+            range: NSRange(location: download.utf16.count + 3, length: 1)
+        )
+        return result
     }
 
     private func statusPanelServiceRow(_ service: NetworkService, allServices: [NetworkService]) -> NSView {
@@ -941,6 +1021,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
                     )
                     self.currentDownloadBytesPerSecond = Double(sample.receivedBytes) / interval
                     self.currentUploadBytesPerSecond = Double(sample.sentBytes) / interval
+                    self.trafficRateHistory.append(
+                        downloadBytesPerSecond: self.currentDownloadBytesPerSecond,
+                        uploadBytesPerSecond: self.currentUploadBytesPerSecond,
+                        at: sampleDate
+                    )
+                    self.statusPanelTrafficRatesLabel?.attributedStringValue = self.statusPanelTrafficRateText
+                    self.statusPanelTrafficChart?.samples = self.trafficRateHistory.samples
                     self.updateUsageDisplay()
                     self.applyMenuBarAppearance()
                 }
