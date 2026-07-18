@@ -56,6 +56,50 @@ struct MenuBarTrafficPresentation: Equatable {
 
 }
 
+struct MenuBarTrafficColumns: Equatable {
+    let download: String
+    let upload: String
+
+    static func parse(combinedLine: String) -> MenuBarTrafficColumns? {
+        let parts = combinedLine.components(separatedBy: "  ")
+        guard parts.count == 2,
+              parts[0].hasPrefix("↓"),
+              parts[1].hasPrefix("↑") else { return nil }
+        return MenuBarTrafficColumns(download: parts[0], upload: parts[1])
+    }
+}
+
+struct MenuBarRateParts: Equatable {
+    let direction: String
+    let number: String
+    let unit: String
+
+    static func parse(_ value: String) -> MenuBarRateParts? {
+        guard let direction = value.first, direction == "↓" || direction == "↑" else { return nil }
+        let body = value.dropFirst()
+        guard let separator = body.firstIndex(of: " ") else { return nil }
+        let number = String(body[..<separator])
+        let unit = String(body[body.index(after: separator)...])
+        guard !number.isEmpty, !unit.isEmpty else { return nil }
+        return MenuBarRateParts(direction: String(direction), number: number, unit: unit)
+    }
+}
+
+struct MenuBarTwoLineGeometry: Equatable {
+    let textWidth: CGFloat
+
+    static func make(
+        topWidth: CGFloat,
+        bottomWidth: CGFloat
+    ) -> MenuBarTwoLineGeometry {
+        MenuBarTwoLineGeometry(textWidth: max(topWidth, bottomWidth))
+    }
+
+    func centeredX(contentWidth: CGFloat) -> CGFloat {
+        max((textWidth - contentWidth) / 2, 0)
+    }
+}
+
 struct MenuBarRenderState: Equatable {
     let symbolName: String
     let presentation: MenuBarTrafficPresentation

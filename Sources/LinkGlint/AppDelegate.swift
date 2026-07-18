@@ -1031,10 +1031,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         let topAttributes: [NSAttributedString.Key: Any] = [.font: topFont, .foregroundColor: NSColor.black]
         let bottomAttributes: [NSAttributedString.Key: Any] = [.font: bottomFont, .foregroundColor: NSColor.black]
         let topWidth = ceil((lines[0] as NSString).size(withAttributes: topAttributes).width)
-        let bottomWidth = ceil((lines[1] as NSString).size(withAttributes: bottomAttributes).width)
+        let combinedColumns = MenuBarTrafficColumns.parse(combinedLine: lines[1])
+
+        func ratePair(_ first: String, _ second: String) -> (MenuBarRateParts, MenuBarRateParts)? {
+            guard let firstRate = MenuBarRateParts.parse(first),
+                  let secondRate = MenuBarRateParts.parse(second) else { return nil }
+            return (firstRate, secondRate)
+        }
+
+        let combinedRates = combinedColumns.flatMap { ratePair($0.download, $0.upload) }
+        let speedOnlyRates = ratePair(lines[0], lines[1])
+        let representativeRate = combinedRates?.0 ?? speedOnlyRates?.0
+        let unitSamples = representativeRate?.unit.hasSuffix("bps") == true
+            ? ["bps", "Kbps", "Mbps", "Gbps", "Tbps"]
+            : ["B/s", "KB/s", "MB/s", "GB/s", "TB/s"]
+        // Reserve a stable outer width for the active Byte/bit family. The live
+        // rate pair is drawn as one centered, naturally spaced group inside it.
+        let rateSamples = ["↓", "↑"].flatMap { direction in
+            ["0", "9.9", "10", "999"].flatMap { number in
+                unitSamples.map { "\(direction)\(number) \($0)" }
+            }
+        }
+        let rateGroupWidth = rateSamples.map {
+            ceil(($0 as NSString).size(withAttributes: bottomAttributes).width)
+        }.max() ?? 0
+        let groupGap: CGFloat = 4
+        let geometry: MenuBarTwoLineGeometry
+        if combinedRates != nil {
+            geometry = .make(
+                topWidth: topWidth,
+                bottomWidth: rateGroupWidth * 2 + groupGap
+            )
+        } else if speedOnlyRates != nil {
+            geometry = .make(
+                topWidth: rateGroupWidth,
+                bottomWidth: rateGroupWidth
+            )
+        } else {
+            let bottomWidth = ceil((lines[1] as NSString).size(withAttributes: bottomAttributes).width)
+            geometry = .make(
+                topWidth: topWidth,
+                bottomWidth: bottomWidth
+            )
+        }
         let iconBoxSize = NSSize(width: 18, height: 16)
         let spacing: CGFloat = 4
-        let textWidth = max(topWidth, bottomWidth)
+        let textWidth = geometry.textWidth
         let imageSize = NSSize(width: iconBoxSize.width + spacing + textWidth, height: 20)
 
         let image = NSImage(size: imageSize, flipped: false) { rect in
@@ -1057,14 +1099,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
                 )
             }
             let textX = iconBoxSize.width + spacing
-            (lines[0] as NSString).draw(
-                in: NSRect(x: textX, y: 9.7, width: textWidth, height: 10.3),
-                withAttributes: topAttributes
-            )
-            (lines[1] as NSString).draw(
-                in: NSRect(x: textX, y: -0.1, width: textWidth, height: 10.2),
-                withAttributes: bottomAttributes
-            )
+            func drawRate(
+                _ rate: MenuBarRateParts,
+                x: CGFloat,
+                y: CGFloat
+            ) {
+                let rateText = "\(rate.direction)\(rate.number) \(rate.unit)"
+                (rateText as NSString).draw(
+                    in: NSRect(x: x, y: y, width: rateGroupWidth, height: 10.2),
+                    withAttributes: bottomAttributes
+                )
+            }
+
+            func rateText(_ rate: MenuBarRateParts) -> String {
+                "\(rate.direction)\(rate.number) \(rate.unit)"
+            }
+
+            let centeredTopX = textX + geometry.centeredX(contentWidth: topWidth)
+
+            if let rates = combinedRates {
+                (lines[0] as NSString).draw(
+                    in: NSRect(x: centeredTopX, y: 9.7, width: topWidth, height: 10.3),
+                    withAttributes: topAttributes
+                )
+                let downloadText = rateText(rates.0)
+                let uploadText = rateText(rates.1)
+                let downloadWidth = ceil((downloadText as NSString).size(withAttributes: bottomAttributes).width)
+                let uploadWidth = ceil((uploadText as NSString).size(withAttributes: bottomAttributes).width)
+                let livePairWidth = downloadWidth + groupGap + uploadWidth
+                let livePairX = textX + geometry.centeredX(contentWidth: livePairWidth)
+                (downloadText as NSString).draw(
+                    in: NSRect(x: livePairX, y: -0.1, width: downloadWidth, height: 10.2),
+                    withAttributes: bottomAttributes
+                )
+                (uploadText as NSString).draw(
+                    in: NSRect(
+                        x: livePairX + downloadWidth + groupGap,
+                        y: -0.1,
+                        width: uploadWidth,
+                        height: 10.2
+                    ),
+                    withAttributes: bottomAttributes
+                )
+            } else if let rates = speedOnlyRates {
+                let downloadWidth = ceil((rateText(rates.0) as NSString).size(withAttributes: bottomAttributes).width)
+                let uploadWidth = ceil((rateText(rates.1) as NSString).size(withAttributes: bottomAttributes).width)
+                drawRate(rates.0, x: textX + geometry.centeredX(contentWidth: downloadWidth), y: 9.7)
+                drawRate(rates.1, x: textX + geometry.centeredX(contentWidth: uploadWidth), y: -0.1)
+            } else {
+                (lines[0] as NSString).draw(
+                    in: NSRect(x: centeredTopX, y: 9.7, width: topWidth, height: 10.3),
+                    withAttributes: topAttributes
+                )
+                (lines[1] as NSString).draw(
+                    in: NSRect(x: textX, y: -0.1, width: textWidth, height: 10.2),
+                    withAttributes: bottomAttributes
+                )
+            }
             return true
         }
         image.isTemplate = true

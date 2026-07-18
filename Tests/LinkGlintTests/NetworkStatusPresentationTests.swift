@@ -56,6 +56,48 @@ final class NetworkStatusPresentationTests: XCTestCase {
         )
     }
 
+    func testTwoLineTrafficSplitsIntoStableDownloadAndUploadColumns() {
+        XCTAssertEqual(
+            MenuBarTrafficColumns.parse(combinedLine: "↓27 KB/s  ↑13 KB/s"),
+            .init(download: "↓27 KB/s", upload: "↑13 KB/s")
+        )
+        XCTAssertNil(MenuBarTrafficColumns.parse(combinedLine: "↓27 KB/s ↑13 KB/s"))
+        XCTAssertEqual(
+            MenuBarRateParts.parse("↓8.2 KB/s"),
+            .init(direction: "↓", number: "8.2", unit: "KB/s")
+        )
+        XCTAssertEqual(
+            MenuBarRateParts.parse("↑999 Mbps"),
+            .init(direction: "↑", number: "999", unit: "Mbps")
+        )
+        XCTAssertNil(MenuBarRateParts.parse("27 KB/s"))
+
+        let geometry = MenuBarTwoLineGeometry.make(
+            topWidth: 72,
+            bottomWidth: 104
+        )
+        XCTAssertEqual(geometry.textWidth, 104)
+        XCTAssertEqual(geometry.centeredX(contentWidth: 72), 16)
+        XCTAssertEqual(geometry.centeredX(contentWidth: 104), 0)
+        XCTAssertEqual(geometry.centeredX(contentWidth: 120), 0)
+    }
+
+    func testTwoLineOuterWidthDoesNotDependOnLiveRateDigits() {
+        let narrowRates = MenuBarTrafficColumns.parse(combinedLine: "↓0 B/s  ↑8 B/s")
+        let wideRates = MenuBarTrafficColumns.parse(combinedLine: "↓999 MB/s  ↑888 MB/s")
+        XCTAssertNotEqual(narrowRates, wideRates)
+
+        let narrowGeometry = MenuBarTwoLineGeometry.make(
+            topWidth: 70,
+            bottomWidth: 104
+        )
+        let wideGeometry = MenuBarTwoLineGeometry.make(
+            topWidth: 70,
+            bottomWidth: 104
+        )
+        XCTAssertEqual(narrowGeometry, wideGeometry)
+    }
+
     func testTrafficRateUsesStandardReadableUnits() {
         XCTAssertEqual(TrafficRateFormatter.string(bytesPerSecond: 0, usesBits: false), "0 B/s")
         XCTAssertEqual(TrafficRateFormatter.string(bytesPerSecond: 999, usesBits: false), "999 B/s")
