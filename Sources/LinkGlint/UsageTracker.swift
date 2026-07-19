@@ -11,12 +11,16 @@ final class UsageTracker {
     private let key: String
     private let calendar: Calendar
     private var records: [String: DailyNetworkUsage]
-    private var lastPersistedAt: Date?
+    private var lastPersistedUptime: TimeInterval?
 
     private(set) var sessionReceivedBytes: UInt64 = 0
     private(set) var sessionSentBytes: UInt64 = 0
 
-    init(defaults: UserDefaults = .standard, key: String = "dailyNetworkUsage.v1", calendar: Calendar = .current) {
+    init(
+        defaults: UserDefaults = .standard,
+        key: String = "dailyNetworkUsage.v1",
+        calendar: Calendar = .autoupdatingCurrent
+    ) {
         self.defaults = defaults
         self.key = key
         self.calendar = calendar
@@ -32,13 +36,14 @@ final class UsageTracker {
         guard receivedBytes > 0 || sentBytes > 0 else { return }
         let day = dateKey(for: date)
         var usage = records[day] ?? DailyNetworkUsage(dateKey: day, receivedBytes: 0, sentBytes: 0)
-        usage.receivedBytes = usage.receivedBytes &+ receivedBytes
-        usage.sentBytes = usage.sentBytes &+ sentBytes
+        usage.receivedBytes = addingWithoutOverflow(usage.receivedBytes, receivedBytes)
+        usage.sentBytes = addingWithoutOverflow(usage.sentBytes, sentBytes)
         records[day] = usage
-        sessionReceivedBytes = sessionReceivedBytes &+ receivedBytes
-        sessionSentBytes = sessionSentBytes &+ sentBytes
+        sessionReceivedBytes = addingWithoutOverflow(sessionReceivedBytes, receivedBytes)
+        sessionSentBytes = addingWithoutOverflow(sessionSentBytes, sentBytes)
 
-        if lastPersistedAt.map({ date.timeIntervalSince($0) >= 15 }) ?? true {
+        let uptime = ProcessInfo.processInfo.systemUptime
+        if lastPersistedUptime.map({ uptime - $0 >= 15 }) ?? true {
             flush(at: date)
         }
     }
@@ -64,13 +69,17 @@ final class UsageTracker {
         records = records.filter { retainedKeys.contains($0.key) }
         if let data = try? JSONEncoder().encode(records) {
             defaults.set(data, forKey: key)
-            lastPersistedAt = date
+            lastPersistedUptime = ProcessInfo.processInfo.systemUptime
         }
     }
 
     private func dateKey(for date: Date) -> String {
         let parts = calendar.dateComponents([.year, .month, .day], from: date)
         return String(format: "%04d-%02d-%02d", parts.year ?? 0, parts.month ?? 0, parts.day ?? 0)
+    }
+
+    private func addingWithoutOverflow(_ lhs: UInt64, _ rhs: UInt64) -> UInt64 {
+        rhs > UInt64.max - lhs ? UInt64.max : lhs + rhs
     }
 }
 

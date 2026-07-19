@@ -39,14 +39,13 @@ struct RefreshRequestCoalescer {
     }
 
     /// Finishes the active operation and returns the coalesced follow-up, if
-    /// any. While a follow-up exists the coordinator remains in a running state.
+    /// any. The caller submits that value through the normal guarded entry
+    /// point, so a newly started network mutation can defer it safely.
     mutating func finish() -> Bool? {
-        guard let pendingShowsErrors else {
-            isRunning = false
-            return nil
-        }
+        let pending = pendingShowsErrors
         self.pendingShowsErrors = nil
-        return pendingShowsErrors
+        isRunning = false
+        return pending
     }
 }
 
@@ -85,6 +84,8 @@ struct NetworkStatusPresentation: Equatable {
             return .init(title: "无线·\(compact(active.ssid ?? active.name))", symbolName: "wifi")
         case .ethernet:
             return .init(title: "有线·\(compact(active.name))", symbolName: "cable.connector")
+        case .cellular:
+            return .init(title: "移动·\(compact(active.name))", symbolName: "antenna.radiowaves.left.and.right")
         case .vpn:
             return .init(title: "VPN·\(compact(active.name))", symbolName: "lock.shield")
         case .other:
@@ -199,6 +200,28 @@ enum MenuBarRenderPolicy {
     }
 }
 
+enum MenuBarSingleLineLayout {
+    private static let rateExpression = try? NSRegularExpression(
+        pattern: #"([↓↑])([0-9]+(?:\.[0-9]+)?\s+(?:[KMGT]?B/s|[KMGT]?bps))"#
+    )
+
+    static func stabilizedText(_ text: String, rateWidth: Int = 8) -> String {
+        guard rateWidth > 0, let expression = rateExpression else { return text }
+        let result = NSMutableString(string: text)
+        let matches = expression.matches(
+            in: text,
+            range: NSRange(location: 0, length: (text as NSString).length)
+        )
+        for match in matches.reversed() {
+            let valueRange = match.range(at: 2)
+            let value = (text as NSString).substring(with: valueRange)
+            let padding = String(repeating: " ", count: max(rateWidth - value.count, 0))
+            result.replaceCharacters(in: valueRange, with: padding + value)
+        }
+        return result as String
+    }
+}
+
 enum TrafficRateFormatter {
     static func string(bytesPerSecond: Double, usesBits: Bool) -> String {
         let safeBytes = bytesPerSecond.isFinite ? max(bytesPerSecond, 0) : 0
@@ -212,6 +235,14 @@ enum TrafficRateFormatter {
             scaled /= 1_000
             unitIndex += 1
         }
+        // Integer formatting begins at 9.95, so a value in the final half-step
+        // below 1,000 would otherwise render as `1000 KB/s`. Promote that
+        // rounded boundary before formatting to keep every rate inside the
+        // fixed menu-bar column and avoid a one-frame width jump.
+        if scaled >= 999.5, unitIndex < units.count - 1 {
+            scaled /= 1_000
+            unitIndex += 1
+        }
         // Keep corrupted or synthetic counter spikes inside the fixed menu-bar
         // geometry instead of creating an arbitrarily wide status item.
         if unitIndex == units.count - 1, scaled > 999 {
@@ -219,12 +250,25 @@ enum TrafficRateFormatter {
         }
 
         let number: String
-        if unitIndex == 0 || scaled >= 10 {
+        // Values just below 10 can round to "10.0", unexpectedly growing past
+        // the fixed eight-character rate column. Switch to integer formatting
+        // at the half-step where one-decimal output would cross that boundary.
+        if unitIndex == 0 || scaled >= 9.95 {
             number = String(format: "%.0f", scaled)
         } else {
             number = String(format: "%.1f", scaled)
         }
         return "\(number) \(units[unitIndex])"
+    }
+
+    static func fixedWidthString(
+        bytesPerSecond: Double,
+        usesBits: Bool,
+        width: Int = 8
+    ) -> String {
+        let value = string(bytesPerSecond: bytesPerSecond, usesBits: usesBits)
+        guard width > value.count else { return value }
+        return String(repeating: " ", count: width - value.count) + value
     }
 }
 

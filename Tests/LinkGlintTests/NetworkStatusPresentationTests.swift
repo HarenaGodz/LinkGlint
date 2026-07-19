@@ -2,6 +2,13 @@ import XCTest
 @testable import LinkGlint
 
 final class NetworkStatusPresentationTests: XCTestCase {
+    func testSwitchActionIsHiddenForAlreadyActiveRoute() {
+        XCTAssertFalse(NetworkServiceActionPolicy.offersSwitch(to: service(kind: .wifi, primary: true)))
+        XCTAssertTrue(NetworkServiceActionPolicy.offersSwitch(to: service(kind: .ethernet, primary: false)))
+        XCTAssertTrue(NetworkServiceActionPolicy.offersSwitch(to: service(kind: .cellular, primary: false)))
+        XCTAssertFalse(NetworkServiceActionPolicy.offersSwitch(to: service(kind: .vpn, primary: false)))
+    }
+
     func testRefreshRequestsAreCoalescedIntoOneFollowUp() {
         var coalescer = RefreshRequestCoalescer()
 
@@ -9,9 +16,9 @@ final class NetworkStatusPresentationTests: XCTestCase {
         XCTAssertFalse(coalescer.request(showingErrors: false))
         XCTAssertFalse(coalescer.request(showingErrors: false))
         XCTAssertEqual(coalescer.finish(), false)
-        XCTAssertTrue(coalescer.isRunning)
-        XCTAssertNil(coalescer.finish())
         XCTAssertFalse(coalescer.isRunning)
+        XCTAssertTrue(coalescer.request(showingErrors: false))
+        XCTAssertNil(coalescer.finish())
     }
 
     func testUserRefreshUpgradesPendingBackgroundRefresh() {
@@ -139,6 +146,17 @@ final class NetworkStatusPresentationTests: XCTestCase {
         XCTAssertEqual(narrowGeometry, wideGeometry)
     }
 
+    func testSingleLineRatesUseStableCharacterColumns() {
+        XCTAssertEqual(
+            MenuBarSingleLineLayout.stabilizedText("无线·Office  ↓0 B/s ↑9.9 KB/s"),
+            "无线·Office  ↓   0 B/s ↑9.9 KB/s"
+        )
+        XCTAssertEqual(
+            MenuBarSingleLineLayout.stabilizedText("↓999 MB/s ↑10 KB/s"),
+            "↓999 MB/s ↑ 10 KB/s"
+        )
+    }
+
     func testTrafficIndicatorStylesAndFixedMarkerColumns() {
         XCTAssertEqual(MenuBarTrafficIndicatorStyle.coloredDots.title, "蓝橙圆点（推荐）")
         XCTAssertTrue(MenuBarTrafficIndicatorStyle.coloredTriangles.usesColor)
@@ -162,12 +180,25 @@ final class NetworkStatusPresentationTests: XCTestCase {
         XCTAssertEqual(TrafficRateFormatter.string(bytesPerSecond: 1_250, usesBits: false), "1.2 KB/s")
         XCTAssertEqual(TrafficRateFormatter.string(bytesPerSecond: 42_000, usesBits: false), "42 KB/s")
         XCTAssertEqual(TrafficRateFormatter.string(bytesPerSecond: 1_250_000, usesBits: false), "1.2 MB/s")
+        XCTAssertEqual(TrafficRateFormatter.string(bytesPerSecond: 9_990_000_000, usesBits: false), "10 GB/s")
         XCTAssertEqual(TrafficRateFormatter.string(bytesPerSecond: 1_250_000, usesBits: true), "10 Mbps")
         XCTAssertEqual(TrafficRateFormatter.string(bytesPerSecond: .infinity, usesBits: true), "0 bps")
         XCTAssertEqual(
             TrafficRateFormatter.string(bytesPerSecond: .greatestFiniteMagnitude, usesBits: true),
             "999 Tbps"
         )
+    }
+
+    func testFixedWidthTrafficRateKeepsUnitChangesInStableColumns() {
+        let rates = [0, 1_250, 42_000, 1_250_000, 9_990_000_000].map {
+            TrafficRateFormatter.fixedWidthString(
+                bytesPerSecond: Double($0),
+                usesBits: false
+            )
+        }
+        XCTAssertTrue(rates.allSatisfy { $0.count == 8 })
+        XCTAssertEqual(rates[0], "   0 B/s")
+        XCTAssertEqual(rates[2], " 42 KB/s")
     }
 
     func testMenuBarIconFitPreservesWideAndTallAspectRatios() {
@@ -184,6 +215,25 @@ final class NetworkStatusPresentationTests: XCTestCase {
                 bounding: CGSize(width: 18, height: 16)
             ),
             CGSize(width: 8, height: 16)
+        )
+    }
+
+    func testTrafficRatePromotesBeforeRoundingToFourDigits() {
+        XCTAssertEqual(
+            TrafficRateFormatter.string(bytesPerSecond: 999_499, usesBits: false),
+            "999 KB/s"
+        )
+        XCTAssertEqual(
+            TrafficRateFormatter.string(bytesPerSecond: 999_500, usesBits: false),
+            "1.0 MB/s"
+        )
+        XCTAssertEqual(
+            TrafficRateFormatter.string(bytesPerSecond: 999_500 / 8, usesBits: true),
+            "1.0 Mbps"
+        )
+        XCTAssertLessThanOrEqual(
+            TrafficRateFormatter.string(bytesPerSecond: 999_999_999_999_999, usesBits: false).count,
+            8
         )
     }
 
@@ -249,6 +299,16 @@ final class NetworkStatusPresentationTests: XCTestCase {
         XCTAssertEqual(
             NetworkStatusPresentation.make(services: [service(kind: .other, primary: true)], hasLoaded: true),
             .init(title: "其他·测试服务", symbolName: "network")
+        )
+    }
+
+    func testCellularPresentationUsesMobileLabel() {
+        XCTAssertEqual(
+            NetworkStatusPresentation.make(
+                services: [service(kind: .cellular, primary: true)],
+                hasLoaded: true
+            ),
+            .init(title: "移动·测试服务", symbolName: "antenna.radiowaves.left.and.right")
         )
     }
 

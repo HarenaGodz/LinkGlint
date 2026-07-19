@@ -4,7 +4,7 @@ final class TrafficChartView: NSView {
     var samples: [TrafficRateSample] = [] {
         didSet {
             needsDisplay = true
-            setAccessibilityValue(accessibilitySummary)
+            updateAccessibilitySummary()
         }
     }
 
@@ -86,7 +86,16 @@ final class TrafficChartView: NSView {
     private func configureAccessibility() {
         setAccessibilityElement(true)
         setAccessibilityRole(.image)
-        setAccessibilityLabel("实时流量曲线")
+        updateAccessibilitySummary()
+    }
+
+    private func updateAccessibilitySummary() {
+        let summary = accessibilitySummary
+        // AXImage does not reliably expose AXValue. Put the live summary in
+        // properties VoiceOver reads for image roles instead of silently
+        // updating an unsupported value attribute.
+        setAccessibilityLabel("实时流量曲线，\(summary)")
+        setAccessibilityHelp(summary)
     }
 
     private var accessibilitySummary: String {

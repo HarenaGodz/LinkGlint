@@ -16,6 +16,7 @@ enum PrivilegedAccessState: Equatable {
 }
 
 final class PrivilegedHelperManager {
+    private static let helperProtocolVersion = 3
     static let installedHelperPath = "/Library/PrivilegedHelperTools/io.github.harenagodz.LinkGlintHelper"
     // sudo ignores included-directory entries whose filename contains a dot.
     static let sudoersPath = "/etc/sudoers.d/io_github_harenagodz_linkglint"
@@ -25,12 +26,24 @@ final class PrivilegedHelperManager {
     static let legacySudoersPath = "/etc/sudoers.d/local_codex_netbar"
 
     private let fileManager: FileManager
-    private let configurationCacheLock = NSLock()
-    private var configurationCache: (path: String?, checkedAt: Date)?
-    private let configurationCacheLifetime: TimeInterval = 30
+    private let configurationCacheCondition = NSCondition()
+    private var configurationCache: (path: String?, checkedAtUptime: TimeInterval)?
+    private var configurationCacheGeneration: UInt64 = 0
+    private var configurationResolutionInProgress = false
+    private let configurationCacheLifetime: TimeInterval
+    private let systemUptime: () -> TimeInterval
+    private let configurationResolver: (() -> String?)?
 
-    init(fileManager: FileManager = .default) {
+    init(
+        fileManager: FileManager = .default,
+        configurationCacheLifetime: TimeInterval = 30,
+        systemUptime: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        configurationResolver: (() -> String?)? = nil
+    ) {
         self.fileManager = fileManager
+        self.configurationCacheLifetime = configurationCacheLifetime
+        self.systemUptime = systemUptime
+        self.configurationResolver = configurationResolver
     }
 
     var bundledHelperURL: URL? {
@@ -66,23 +79,60 @@ final class PrivilegedHelperManager {
         sudoers="$3"
         account="$4"
         case "$account" in ''|*[!A-Za-z0-9._-]*) exit 64 ;; esac
+        work="$(/usr/bin/mktemp -d /tmp/linkglint-install.XXXXXX)"
+        rollback=1
+        had_target=0
+        had_sudoers=0
+        cleanup() {
+            status=$?
+            set +e
+            if [ "$rollback" -eq 1 ]; then
+                if [ "$had_target" -eq 1 ]; then
+                    /bin/cp -p "$work/target.backup" "$target"
+                else
+                    /bin/rm -f "$target"
+                fi
+                if [ "$had_sudoers" -eq 1 ]; then
+                    /bin/cp -p "$work/sudoers.backup" "$sudoers"
+                else
+                    /bin/rm -f "$sudoers"
+                fi
+            fi
+            /bin/rm -f "$work/target.backup" "$work/sudoers.backup" "$work/sudoers.new"
+            /bin/rmdir "$work" 2>/dev/null || true
+            trap - EXIT
+            exit "$status"
+        }
+        trap cleanup EXIT
+        if [ -e "$target" ]; then
+            /bin/cp -p "$target" "$work/target.backup"
+            had_target=1
+        fi
+        if [ -e "$sudoers" ]; then
+            /bin/cp -p "$sudoers" "$work/sudoers.backup"
+            had_sudoers=1
+        fi
         /usr/bin/install -d -o root -g wheel -m 0755 /Library/PrivilegedHelperTools
         /usr/bin/install -o root -g wheel -m 0755 "$source" "$target"
-        temp="$(/usr/bin/mktemp /tmp/linkglint-sudoers.XXXXXX)"
-        trap '/bin/rm -f "$temp"' EXIT
-        /usr/bin/printf '%s ALL=(root) NOPASSWD: %s *\n' "$account" "$target" > "$temp"
-        /usr/sbin/chown root:wheel "$temp"
-        /bin/chmod 0440 "$temp"
-        /usr/sbin/visudo -cf "$temp" >/dev/null
-        /usr/bin/install -o root -g wheel -m 0440 "$temp" "$sudoers"
+        /usr/bin/printf '%s ALL=(root) NOPASSWD: %s *\n' "$account" "$target" > "$work/sudoers.new"
+        /usr/sbin/chown root:wheel "$work/sudoers.new"
+        /bin/chmod 0440 "$work/sudoers.new"
+        /usr/sbin/visudo -cf "$work/sudoers.new" >/dev/null
+        /usr/bin/install -o root -g wheel -m 0440 "$work/sudoers.new" "$sudoers"
         /usr/sbin/visudo -cf "$sudoers" >/dev/null
         /usr/sbin/visudo -c >/dev/null
         /usr/bin/xattr -d com.apple.quarantine "$target" 2>/dev/null || true
+        rollback=0
         """#
-        try runAdministratorShell(
-            script: script,
-            arguments: [source.path, Self.installedHelperPath, Self.sudoersPath, username]
-        )
+        do {
+            try runAdministratorShell(
+                script: script,
+                arguments: [source.path, Self.installedHelperPath, Self.sudoersPath, username]
+            )
+        } catch {
+            invalidateConfigurationCache()
+            throw error
+        }
         invalidateConfigurationCache()
         guard state == .ready else {
             throw NetworkError.commandFailed("权限助手已安装，但免密码验证未通过。请点击“修复权限”重试。")
@@ -90,6 +140,7 @@ final class PrivilegedHelperManager {
     }
 
     func removeConfiguration() throws {
+        defer { invalidateConfigurationCache() }
         let script = #"""
         set -eu
         /bin/rm -f "$1" "$2" "$3" "$4"
@@ -103,7 +154,6 @@ final class PrivilegedHelperManager {
                 Self.legacySudoersPath
             ]
         )
-        invalidateConfigurationCache()
     }
 
     func run(_ arguments: [String]) throws {
@@ -114,7 +164,11 @@ final class PrivilegedHelperManager {
         // succeeds; if the configuration is damaged, the app reports repair is
         // needed instead of unexpectedly asking for another password.
         do {
-            _ = try CommandRunner.run("/usr/bin/sudo", ["-n", helperPath] + arguments)
+            // The helper applies its own timeout to every networksetup child.
+            // Do not time out the sudo wrapper first: terminating sudo can leave
+            // the root helper finishing a profile after the UI has reported a
+            // failure, producing late and surprising network changes.
+            _ = try CommandRunner.run("/usr/bin/sudo", ["-n", helperPath] + arguments, timeout: nil)
         } catch {
             invalidateConfigurationCache()
             throw error
@@ -122,19 +176,49 @@ final class PrivilegedHelperManager {
     }
 
     private var configuredHelperPath: String? {
-        configurationCacheLock.lock()
-        if let cache = configurationCache,
-           Date().timeIntervalSince(cache.checkedAt) < configurationCacheLifetime {
-            configurationCacheLock.unlock()
-            return cache.path
-        }
-        configurationCacheLock.unlock()
+        while true {
+            let resolutionGeneration: UInt64
+            let now = systemUptime()
+            configurationCacheCondition.lock()
+            if let cache = configurationCache,
+               now >= cache.checkedAtUptime,
+               now - cache.checkedAtUptime < configurationCacheLifetime {
+                configurationCacheCondition.unlock()
+                return cache.path
+            }
+            if configurationResolutionInProgress {
+                configurationCacheCondition.wait()
+                configurationCacheCondition.unlock()
+                continue
+            }
+            configurationResolutionInProgress = true
+            resolutionGeneration = configurationCacheGeneration
+            configurationCacheCondition.unlock()
 
-        let resolvedPath = resolveConfiguredHelperPath()
-        configurationCacheLock.lock()
-        configurationCache = (resolvedPath, Date())
-        configurationCacheLock.unlock()
-        return resolvedPath
+            let resolvedPath: String?
+            if let configurationResolver {
+                resolvedPath = configurationResolver()
+            } else {
+                resolvedPath = resolveConfiguredHelperPath()
+            }
+            let checkedAtUptime = systemUptime()
+
+            configurationCacheCondition.lock()
+            let resolutionIsCurrent = resolutionGeneration == configurationCacheGeneration
+            if resolutionIsCurrent {
+                configurationCache = (resolvedPath, checkedAtUptime)
+            }
+            configurationResolutionInProgress = false
+            configurationCacheCondition.broadcast()
+            configurationCacheCondition.unlock()
+            guard resolutionIsCurrent else {
+                // An install, removal or failed helper invocation invalidated
+                // the cache while this comparatively slow check was running.
+                // Discard its stale result and resolve against the new state.
+                continue
+            }
+            return resolvedPath
+        }
     }
 
     private func resolveConfiguredHelperPath() -> String? {
@@ -147,17 +231,26 @@ final class PrivilegedHelperManager {
                   fileManager.fileExists(atPath: sudoersPath),
                   hasSafeOwnership(path: helperPath),
                   hasSafeOwnership(path: sudoersPath) else { continue }
+            if helperPath == Self.installedHelperPath,
+               let bundledHelperURL,
+               !fileManager.contentsEqual(atPath: helperPath, andPath: bundledHelperURL.path) {
+                // A newer app may include validation or reliability fixes in
+                // its restricted helper. Mark the old root-owned copy for a
+                // one-time repair instead of continuing to invoke stale code.
+                continue
+            }
             guard let output = try? CommandRunner.run("/usr/bin/sudo", ["-n", helperPath, "status"]),
-                  output.contains("LinkGlintHelper ready 2") else { continue }
+                  output.contains("LinkGlintHelper ready \(Self.helperProtocolVersion)") else { continue }
             return helperPath
         }
         return nil
     }
 
-    private func invalidateConfigurationCache() {
-        configurationCacheLock.lock()
+    func invalidateConfigurationCache() {
+        configurationCacheCondition.lock()
         configurationCache = nil
-        configurationCacheLock.unlock()
+        configurationCacheGeneration &+= 1
+        configurationCacheCondition.unlock()
     }
 
     private func hasSafeOwnership(path: String) -> Bool {
@@ -178,6 +271,12 @@ final class PrivilegedHelperManager {
             do shell script commandText with administrator privileges
         end run
         """
-        _ = try CommandRunner.run("/usr/bin/osascript", ["-e", appleScript, script] + arguments)
+        // The administrator sheet waits for explicit user interaction and must
+        // not be cancelled by the normal background-command timeout.
+        _ = try CommandRunner.run(
+            "/usr/bin/osascript",
+            ["-e", appleScript, script] + arguments,
+            timeout: nil
+        )
     }
 }

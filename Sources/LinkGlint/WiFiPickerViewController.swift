@@ -1,9 +1,46 @@
 import AppKit
 
+/// Tracks one coalesced retry while CoreWLAN is still servicing the previous
+/// scan. Tokens make delayed timeout callbacks harmless after the request has
+/// completed, been cancelled, or been replaced by a later picker session.
+struct WiFiPendingScanRequest {
+    private(set) var isPending = false
+    private var token: UInt = 0
+
+    /// Returns a timeout token for the first pending request. Repeated clicks
+    /// stay coalesced and do not extend the original bounded wait.
+    mutating func enqueue() -> UInt? {
+        guard !isPending else { return nil }
+        token &+= 1
+        isPending = true
+        return token
+    }
+
+    mutating func expire(token expectedToken: UInt) -> Bool {
+        guard isPending, token == expectedToken else { return false }
+        isPending = false
+        token &+= 1
+        return true
+    }
+
+    mutating func consume() -> Bool {
+        guard isPending else { return false }
+        isPending = false
+        token &+= 1
+        return true
+    }
+
+    mutating func cancel() {
+        isPending = false
+        token &+= 1
+    }
+}
+
 final class WiFiPickerViewController: NSViewController, NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate {
     var onRefresh: (() -> Void)?
-    var onConnect: ((String, String?) -> Void)?
+    var onConnect: ((String, String?, Bool) -> Void)?
     var onDismiss: (() -> Void)?
+    var onSuspendScan: (() -> Void)?
     var onOpenLocationSettings: (() -> Void)?
     var onPreferredSizeChange: ((NSSize) -> Void)?
 
@@ -13,6 +50,7 @@ final class WiFiPickerViewController: NSViewController, NSTextFieldDelegate, NST
     private weak var nameField: NSTextField?
     private weak var passwordField: NSSecureTextField?
     private weak var connectButton: NSButton?
+    private var credentialNetworkIsSecure = false
 
     override func loadView() {
         let size = NSSize(width: 360, height: 380)
@@ -21,13 +59,33 @@ final class WiFiPickerViewController: NSViewController, NSTextFieldDelegate, NST
     }
 
     func showLoading() {
+        showScanProgress(
+            message: "正在扫描附近的 Wi-Fi…",
+            subtitle: "扫描可能需要几秒钟"
+        )
+    }
+
+    func showWaitingForCurrentScan() {
+        showScanProgress(
+            message: "正在等待上一次扫描结束…",
+            subtitle: "已合并请求 · 不会重复扫描"
+        )
+    }
+
+    private func showScanProgress(message: String, subtitle: String) {
         let spinner = NSProgressIndicator()
         spinner.style = .spinning
         spinner.controlSize = .small
         spinner.startAnimation(nil)
-        let label = secondaryLabel("正在扫描附近的 Wi-Fi…")
+        let label = secondaryLabel(message)
         let body = centeredBody([spinner, label])
-        install(title: "选择 Wi-Fi", subtitle: "扫描可能需要几秒钟", body: body, footer: manualButton(), size: NSSize(width: 332, height: 250))
+        install(
+            title: "选择 Wi-Fi",
+            subtitle: subtitle,
+            body: body,
+            footer: manualButton(),
+            size: NSSize(width: 332, height: 250)
+        )
     }
 
     func showLocationRequest() {
@@ -72,6 +130,7 @@ final class WiFiPickerViewController: NSViewController, NSTextFieldDelegate, NST
         self.currentSSID = currentSSID
 
         let body: NSView
+        var tableToFocus: WiFiNetworkTableView?
         if networks.isEmpty {
             let icon = symbolView("wifi.slash", color: .secondaryLabelColor, size: 28)
             let title = NSTextField(labelWithString: "未发现附近网络")
@@ -80,17 +139,23 @@ final class WiFiPickerViewController: NSViewController, NSTextFieldDelegate, NST
             body = centeredBody([icon, title, detail])
         } else {
             tableNetworks = networks
-            let table = NSTableView()
+            let table = WiFiNetworkTableView()
             let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("wifi-network"))
             column.resizingMask = .autoresizingMask
             table.addTableColumn(column)
             table.headerView = nil
             table.backgroundColor = .clear
-            table.selectionHighlightStyle = .none
+            table.selectionHighlightStyle = .regular
+            table.allowsEmptySelection = false
+            table.allowsMultipleSelection = false
             table.rowHeight = 48
             table.intercellSpacing = NSSize(width: 0, height: 2)
             table.dataSource = self
             table.delegate = self
+            table.onActivate = { [weak self, weak table] in
+                guard let self, let table, self.tableNetworks.indices.contains(table.selectedRow) else { return }
+                self.chooseNetwork(self.tableNetworks[table.selectedRow])
+            }
             let scroll = NSScrollView()
             scroll.drawsBackground = false
             scroll.borderType = .noBorder
@@ -99,20 +164,68 @@ final class WiFiPickerViewController: NSViewController, NSTextFieldDelegate, NST
             scroll.autohidesScrollers = true
             scroll.documentView = table
             body = scroll
+            tableToFocus = table
         }
 
         let countText = networks.isEmpty ? "没有可用网络" : "发现 \(networks.count) 个网络"
         install(title: "选择 Wi-Fi", subtitle: countText, body: body, footer: manualButton(), size: NSSize(width: 332, height: 380))
+        if let tableToFocus {
+            let selectedRow = networks.firstIndex(where: { $0.ssid == currentSSID }) ?? 0
+            tableToFocus.selectRowIndexes(IndexSet(integer: selectedRow), byExtendingSelection: false)
+            DispatchQueue.main.async { [weak self, weak tableToFocus] in
+                self?.view.window?.makeFirstResponder(tableToFocus)
+            }
+        }
     }
 
-    private func showCredentials(ssid: String?, isSecure: Bool) {
+    func showConnecting(to ssid: String) {
+        let spinner = NSProgressIndicator()
+        spinner.style = .spinning
+        spinner.controlSize = .small
+        spinner.startAnimation(nil)
+        let detail = secondaryLabel("正在等待 macOS 完成连接…")
+        let body = centeredBody([spinner, detail])
+        let close = NSButton(title: "返回网络面板", target: self, action: #selector(closePicker))
+        close.bezelStyle = .rounded
+        close.controlSize = .small
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let footer = NSStackView(views: [spacer, close])
+        footer.orientation = .horizontal
+        footer.alignment = .centerY
+        install(
+            title: "正在连接“\(ssid)”",
+            subtitle: "现有连接会保留到目标网络就绪",
+            body: body,
+            footer: footer,
+            size: NSSize(width: 360, height: 250),
+            showsRefresh: false
+        )
+    }
+
+    func showConnectionError(ssid: String, password: String?, isSecure: Bool, message: String) {
+        showCredentials(
+            ssid: ssid,
+            isSecure: isSecure,
+            passwordValue: password ?? "",
+            errorMessage: message
+        )
+    }
+
+    private func showCredentials(
+        ssid: String?,
+        isSecure: Bool,
+        passwordValue: String = "",
+        errorMessage: String? = nil
+    ) {
+        credentialNetworkIsSecure = isSecure
         let name = NSTextField(string: ssid ?? "")
         name.placeholderString = "网络名称（SSID）"
         name.delegate = self
         name.heightAnchor.constraint(equalToConstant: 26).isActive = true
         nameField = name
 
-        let password = NSSecureTextField(string: "")
+        let password = NSSecureTextField(string: passwordValue)
         password.placeholderString = isSecure ? "留空以尝试已保存的密码" : "密码（开放网络可留空）"
         password.delegate = self
         password.heightAnchor.constraint(equalToConstant: 26).isActive = true
@@ -132,7 +245,8 @@ final class WiFiPickerViewController: NSViewController, NSTextFieldDelegate, NST
         form.column(at: 0).xPlacement = .trailing
         form.column(at: 1).xPlacement = .fill
 
-        let hint = secondaryLabel(isSecure ? "已保存过此网络时，可直接留空密码连接。" : "请输入网络信息后连接。")
+        let hint = wrappingLabel(errorMessage ?? (isSecure ? "已保存过此网络时，可直接留空密码连接。" : "请输入网络信息后连接。"))
+        if errorMessage != nil { hint.textColor = .systemRed }
         let content = NSStackView(views: [form, hint])
         content.orientation = .vertical
         content.alignment = .width
@@ -143,7 +257,7 @@ final class WiFiPickerViewController: NSViewController, NSTextFieldDelegate, NST
         back.controlSize = .small
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let connect = NSButton(title: "连接", target: self, action: #selector(connect))
+        let connect = NSButton(title: errorMessage == nil ? "连接" : "重试连接", target: self, action: #selector(connect))
         connect.bezelStyle = .rounded
         connect.controlSize = .small
         connect.keyEquivalent = "\r"
@@ -161,7 +275,12 @@ final class WiFiPickerViewController: NSViewController, NSTextFieldDelegate, NST
             size: NSSize(width: 360, height: 250),
             showsRefresh: false
         )
-        view.window?.makeFirstResponder(ssid == nil ? name : password)
+        let firstResponder = ssid == nil ? name : password
+        DispatchQueue.main.async { [weak self, weak firstResponder] in
+            self?.view.window?.makeKey()
+            self?.view.window?.makeFirstResponder(firstResponder)
+            if errorMessage != nil { firstResponder?.selectText(nil) }
+        }
     }
 
     private func networkRow(_ network: WiFiNetwork, isCurrent: Bool) -> NSView {
@@ -260,7 +379,7 @@ final class WiFiPickerViewController: NSViewController, NSTextFieldDelegate, NST
             let refresh = iconButton("arrow.clockwise", help: "重新扫描", action: #selector(refresh))
             headerViews.append(refresh)
         }
-        headerViews.append(iconButton("xmark", help: "关闭", action: #selector(closePicker)))
+        headerViews.append(iconButton("chevron.backward", help: "返回网络面板", action: #selector(closePicker)))
         let header = NSStackView(views: headerViews)
         header.orientation = .horizontal
         header.alignment = .centerY
@@ -327,7 +446,6 @@ final class WiFiPickerViewController: NSViewController, NSTextFieldDelegate, NST
     private func iconButton(_ symbol: String, help: String, action: Selector) -> NSButton {
         let button = NSButton(image: NSImage(systemSymbolName: symbol, accessibilityDescription: help) ?? NSImage(), target: self, action: action)
         button.isBordered = false
-        button.focusRingType = .none
         button.toolTip = help
         return button
     }
@@ -365,23 +483,35 @@ final class WiFiPickerViewController: NSViewController, NSTextFieldDelegate, NST
     @objc private func refresh() { onRefresh?() }
     @objc private func closePicker() { onDismiss?() }
     @objc private func openLocationSettings() { onOpenLocationSettings?() }
-    @objc private func manualNetwork() { showCredentials(ssid: nil, isSecure: false) }
+    @objc private func manualNetwork() {
+        onSuspendScan?()
+        showCredentials(ssid: nil, isSecure: false)
+    }
     @objc private func backToList() { showNetworks(lastNetworks, currentSSID: currentSSID) }
 
     @objc private func selectNetwork(_ sender: WiFiNetworkRowButton) {
         guard let network = sender.network else { return }
+        chooseNetwork(network)
+    }
+
+    private func chooseNetwork(_ network: WiFiNetwork) {
+        guard network.ssid != currentSSID else { return }
         if network.isSecure {
             showCredentials(ssid: network.ssid, isSecure: true)
         } else {
-            onConnect?(network.ssid, nil)
+            onConnect?(network.ssid, nil, false)
         }
     }
 
     @objc private func connect() {
-        let ssid = nameField?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !ssid.isEmpty else { return }
+        let ssid = nameField?.stringValue ?? ""
+        guard !ssid.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         let password = passwordField?.stringValue ?? ""
-        onConnect?(ssid, password.isEmpty ? nil : password)
+        onConnect?(
+            ssid,
+            password.isEmpty ? nil : password,
+            credentialNetworkIsSecure || !password.isEmpty
+        )
     }
 
     func controlTextDidChange(_ obj: Notification) {
@@ -392,6 +522,18 @@ final class WiFiPickerViewController: NSViewController, NSTextFieldDelegate, NST
 
 private final class WiFiNetworkRowButton: NSButton {
     var network: WiFiNetwork?
+}
+
+private final class WiFiNetworkTableView: NSTableView {
+    var onActivate: (() -> Void)?
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 36 || event.keyCode == 76 {
+            onActivate?()
+            return
+        }
+        super.keyDown(with: event)
+    }
 }
 
 private final class WiFiPickerBackgroundView: NSView {

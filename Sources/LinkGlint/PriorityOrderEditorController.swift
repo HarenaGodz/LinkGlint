@@ -202,6 +202,7 @@ private final class PriorityOrderCellView: NSTableCellView {
     func configure(service: NetworkService, position: Int) {
         positionLabel.stringValue = "\(position)"
         nameLabel.stringValue = service.name
+        nameLabel.toolTip = service.name
         if service.isPrimary {
             stateLabel.stringValue = "当前出口"
             stateLabel.textColor = .systemGreen

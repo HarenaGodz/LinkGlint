@@ -45,6 +45,18 @@ final class UsageTrackerTests: XCTestCase {
         XCTAssertEqual(second.sessionReceivedBytes, 0)
     }
 
+    func testUsageCountersSaturateInsteadOfWrapping() {
+        let tracker = UsageTracker(defaults: defaults, key: "usage", calendar: calendar)
+        let date = makeDate(2026, 7, 16)
+        tracker.record(receivedBytes: UInt64.max, sentBytes: UInt64.max, at: date)
+        tracker.record(receivedBytes: 1, sentBytes: 1, at: date)
+
+        XCTAssertEqual(tracker.usage(for: date).receivedBytes, UInt64.max)
+        XCTAssertEqual(tracker.usage(for: date).sentBytes, UInt64.max)
+        XCTAssertEqual(tracker.sessionReceivedBytes, UInt64.max)
+        XCTAssertEqual(tracker.sessionSentBytes, UInt64.max)
+    }
+
     func testResetTodayDoesNotDeleteOtherDays() {
         let tracker = UsageTracker(defaults: defaults, key: "usage", calendar: calendar)
         let firstDay = makeDate(2026, 7, 15)

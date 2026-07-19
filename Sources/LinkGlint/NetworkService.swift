@@ -21,15 +21,65 @@ struct WiFiScanResult: Equatable {
     let currentSSID: String?
 }
 
+enum WiFiSSIDReadOutcome: Equatable {
+    /// The command completed. A nil value explicitly means the interface is
+    /// not associated and must clear any older name.
+    case current(String?)
+    /// The command itself failed, so its result says nothing about association.
+    case failed
+}
+
+/// Smooths over a short-lived `networksetup -getairportnetwork` failure without
+/// turning an old SSID into permanent state. Explicit disconnects clear the
+/// cache immediately; command failures may reuse one recent trusted value.
+struct WiFiSSIDStabilityCache {
+    private var entries: [String: (ssid: String, checkedAtUptime: TimeInterval)] = [:]
+    let fallbackLifetime: TimeInterval
+
+    init(fallbackLifetime: TimeInterval = 90) {
+        self.fallbackLifetime = max(fallbackLifetime, 0)
+    }
+
+    mutating func resolve(
+        device: String,
+        connectionIsEligible: Bool,
+        outcome: WiFiSSIDReadOutcome,
+        uptime: TimeInterval
+    ) -> String? {
+        guard connectionIsEligible else {
+            entries.removeValue(forKey: device)
+            return nil
+        }
+        switch outcome {
+        case .current(let ssid):
+            if let ssid {
+                entries[device] = (ssid, uptime)
+            } else {
+                entries.removeValue(forKey: device)
+            }
+            return ssid
+        case .failed:
+            guard let cached = entries[device],
+                  uptime >= cached.checkedAtUptime,
+                  uptime - cached.checkedAtUptime <= fallbackLifetime else {
+                entries.removeValue(forKey: device)
+                return nil
+            }
+            return cached.ssid
+        }
+    }
+}
+
 enum WiFiNetworkCatalog {
     static func normalized(_ networks: [WiFiNetwork], currentSSID: String?) -> [WiFiNetwork] {
         var strongestBySSID: [String: WiFiNetwork] = [:]
         for network in networks {
-            let ssid = network.ssid.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !ssid.isEmpty else { continue }
-            let candidate = WiFiNetwork(ssid: ssid, rssiValue: network.rssiValue, isSecure: network.isSecure)
-            if candidate.rssiValue > (strongestBySSID[ssid]?.rssiValue ?? Int.min) {
-                strongestBySSID[ssid] = candidate
+            guard !network.ssid.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+            // Leading and trailing spaces are legal SSID bytes. Use trimming
+            // only to reject an all-whitespace placeholder, never as the name
+            // sent back to CoreWLAN/networksetup.
+            if network.rssiValue > (strongestBySSID[network.ssid]?.rssiValue ?? Int.min) {
+                strongestBySSID[network.ssid] = network
             }
         }
         return strongestBySSID.values.sorted { lhs, rhs in
@@ -46,6 +96,7 @@ struct NetworkService: Hashable {
     enum Kind {
         case wifi
         case ethernet
+        case cellular
         case vpn
         case other
     }
@@ -82,6 +133,19 @@ struct NetworkService: Hashable {
         if !dnsServers.isEmpty { lines.append("DNS：\(dnsServers.joined(separator: ", "))") }
         if let macAddress { lines.append("MAC 地址：\(macAddress)") }
         return lines.joined(separator: "\n")
+    }
+
+    var isPhysicalTransport: Bool {
+        kind == .wifi || kind == .ethernet || kind == .cellular
+    }
+}
+
+enum NetworkServiceActionPolicy {
+    static func offersSwitch(to service: NetworkService) -> Bool {
+        guard service.isPhysicalTransport else { return false }
+        // Switching to the route that is already active does not change the
+        // user's connection or service order.
+        return !service.isPrimary || !service.connected
     }
 }
 
@@ -160,28 +224,25 @@ enum NetworkServiceTransition {
 
     static func switching(
         services: [NetworkService],
-        target: String,
-        disabledServices: [String]
+        target: String
     ) -> [NetworkService] {
         guard services.contains(where: { $0.name == target }) else { return services }
-        let disabledNames = Set(disabledServices)
         return services.map { service in
             let isTarget = service.name == target
-            let isDisabled = disabledNames.contains(service.name)
             return NetworkService(
                 name: service.name,
                 orderIndex: service.orderIndex,
                 hardwarePort: service.hardwarePort,
                 device: service.device,
-                enabled: isTarget ? true : (isDisabled ? false : service.enabled),
-                connected: isTarget ? true : (isDisabled ? false : service.connected),
+                enabled: isTarget ? true : service.enabled,
+                connected: service.connected,
                 ipAddress: service.ipAddress,
                 subnetMask: service.subnetMask,
                 router: service.router,
                 dnsServers: service.dnsServers,
                 macAddress: service.macAddress,
                 ssid: service.ssid,
-                isPrimary: isTarget,
+                isPrimary: service.isPrimary,
                 kind: service.kind,
                 wifiPowered: service.kind == .wifi && isTarget ? true : service.wifiPowered
             )
@@ -200,9 +261,12 @@ struct NetworkDiagnostic {
     var summary: String {
         guard defaultInterface != nil else { return "未检测到默认网络" }
         if gatewayLatencyMilliseconds != nil && dnsLookupSucceeded { return "网络状态良好" }
-        if gatewayLatencyMilliseconds == nil { return "无法连接本地网关" }
+        if gatewayLatencyMilliseconds == nil && dnsLookupSucceeded { return "网络可用 · 网关未响应延迟检测" }
+        if gatewayLatencyMilliseconds == nil { return "网络连通性需要检查" }
         return "DNS 查询异常"
     }
+
+    var isUsable: Bool { defaultInterface != nil && dnsLookupSucceeded }
 }
 
 enum NetworkError: LocalizedError {
@@ -213,14 +277,39 @@ enum NetworkError: LocalizedError {
         switch self {
         case .commandFailed(let message): return message
         case .privilegedAccessRequired:
-            return "请先完成一次免密码网络切换配置。之后日常切换和登录启动都不再要求输入密码。"
+            return "请先完成一次免密码网络切换配置。之后日常网络修改不再要求输入密码；登录时启动无需此权限。"
         }
+    }
+}
+
+/// Avoid driving CoreWLAN association and radio scanning concurrently. The app
+/// performs both operations away from the main thread; this gate serializes
+/// access while keeping the wait bounded if a framework call gets stuck inside
+/// macOS.
+final class CoreWLANAccessGate {
+    private let semaphore = DispatchSemaphore(value: 1)
+
+    func withAccess<T>(
+        waitTimeout: TimeInterval = 3,
+        operation: () throws -> T
+    ) throws -> T {
+        guard semaphore.wait(timeout: .now() + max(waitTimeout, 0)) == .success else {
+            throw NetworkError.commandFailed(
+                "Wi-Fi 正在完成另一项扫描或连接，请稍后重试。"
+            )
+        }
+        defer { semaphore.signal() }
+        return try operation()
     }
 }
 
 enum CommandRunner {
     @discardableResult
-    static func run(_ executable: String, _ arguments: [String] = []) throws -> String {
+    static func run(
+        _ executable: String,
+        _ arguments: [String] = [],
+        timeout: TimeInterval? = 20
+    ) throws -> String {
         let process = Process()
         let output = Pipe()
         process.executableURL = URL(fileURLWithPath: executable)
@@ -228,11 +317,41 @@ enum CommandRunner {
         process.standardOutput = output
         process.standardError = output
         try process.run()
+        let stateLock = NSLock()
+        var timedOut = false
+        let timeoutWork: DispatchWorkItem?
+        if let timeout {
+            let work = DispatchWorkItem {
+                stateLock.lock()
+                defer { stateLock.unlock() }
+                guard process.isRunning else { return }
+                timedOut = true
+                process.terminate()
+                let processID = process.processIdentifier
+                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1) {
+                    stateLock.lock()
+                    defer { stateLock.unlock() }
+                    if process.isRunning { kill(processID, SIGKILL) }
+                }
+            }
+            timeoutWork = work
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + max(timeout, 0.1), execute: work)
+        } else {
+            timeoutWork = nil
+        }
         // Drain the pipe while the child is running. Waiting first can deadlock
         // once output fills the kernel pipe buffer.
         let data = output.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
+        timeoutWork?.cancel()
+        stateLock.lock()
+        let didTimeOut = timedOut
+        stateLock.unlock()
         let text = String(data: data, encoding: .utf8) ?? ""
+        if didTimeOut {
+            let executableName = URL(fileURLWithPath: executable).lastPathComponent
+            throw NetworkError.commandFailed("命令 \(executableName) 执行超时，请稍后重试。")
+        }
         guard process.terminationStatus == 0 else {
             let detail = text.trimmingCharacters(in: .whitespacesAndNewlines)
             let executableName = URL(fileURLWithPath: executable).lastPathComponent
@@ -249,7 +368,10 @@ enum CommandRunner {
 
 final class NetworkManager {
     private let networksetup = "/usr/sbin/networksetup"
+    private static let coreWLANAccessGate = CoreWLANAccessGate()
     private let privilegedHelper: PrivilegedHelperManager
+    private let wifiSSIDCacheLock = NSLock()
+    private var wifiSSIDCache = WiFiSSIDStabilityCache()
 
     init(privilegedHelper: PrivilegedHelperManager = PrivilegedHelperManager()) {
         self.privilegedHelper = privilegedHelper
@@ -271,13 +393,24 @@ final class NetworkManager {
         let serviceStates = parseServiceStates(enabledOutput)
         let mappings = parseServiceMappings(orderOutput)
         let configuredOrder = parseServiceOrder(orderOutput)
-        let priorityByName = Dictionary(uniqueKeysWithValues: configuredOrder.enumerated().map { ($0.element, $0.offset) })
+        let priorityByName = Dictionary(
+            configuredOrder.enumerated().map { ($0.element, $0.offset) },
+            uniquingKeysWith: { first, _ in first }
+        )
         let primaryDevice = defaultRouteInterface()
+        let connectedVPNNames = activeVPNServiceNames()
+        let connectedVPNInterfaces = activeVPNInterfaceNames(for: connectedVPNNames)
+        let primaryVPNName = primaryVPNServiceName(
+            connectedNames: connectedVPNNames,
+            interfacesByName: connectedVPNInterfaces,
+            defaultInterface: primaryDevice
+        )
 
         // `networksetup` exposes per-service details through separate commands.
         // Read independent services concurrently so machines with many adapters
         // do not pay the full subprocess latency serially on every refresh.
         var resolvedServices = Array<NetworkService?>(repeating: nil, count: serviceStates.count)
+        var firstDetailError: Error?
         let resultLock = NSLock()
         let detailQueue = OperationQueue()
         detailQueue.name = "io.github.harenagodz.LinkGlint.service-details"
@@ -286,97 +419,176 @@ final class NetworkManager {
 
         for (fallbackIndex, state) in serviceStates.enumerated() {
             detailQueue.addOperation { [self] in
-                let (name, enabled) = state
-                let priorityIndex = priorityByName[name] ?? (configuredOrder.count + fallbackIndex)
-                let mapping = mappings[name]
-                let info = (try? CommandRunner.run(networksetup, ["-getinfo", name])) ?? ""
-                let ip = parseValue("IP address", in: info).flatMap { value in
-                    let lower = value.lowercased()
-                    return (lower == "none" || value == "0.0.0.0") ? nil : value
-                }
-                let device = mapping?.device
-                let interface = device.map(interfaceDetails) ?? (active: false, macAddress: nil)
-                let kind = classify(name: name, hardwarePort: mapping?.port)
-                let wifiPower: Bool?
-                let ssid: String?
-                if kind == .wifi, let device {
-                    let output = try? CommandRunner.run(networksetup, ["-getairportpower", device])
-                    wifiPower = output.map { $0.localizedCaseInsensitiveContains(": On") }
-                    if wifiPower == true {
-                        let networkOutput = try? CommandRunner.run(networksetup, ["-getairportnetwork", device])
-                        ssid = networkOutput.flatMap(parseCurrentWiFiNetwork)
+                do {
+                    let (name, enabled) = state
+                    let priorityIndex = priorityByName[name] ?? (configuredOrder.count + fallbackIndex)
+                    let mapping = mappings[name]
+                    // A failed critical read must fail this refresh and preserve
+                    // the last trusted snapshot. Treating an error as empty data
+                    // makes an online adapter flicker to offline/no-DNS.
+                    let info = try CommandRunner.run(networksetup, ["-getinfo", name])
+                    let ipv4 = parseValue("IP address", in: info).flatMap(validIPAddressValue)
+                    let ipv6 = parseValue("IPv6 IP address", in: info).flatMap(validIPAddressValue)
+                    let ip = ipv4 ?? ipv6
+                    // `networksetup` commonly reports `--` as the device for a
+                    // VPN. Recover the live utun/ppp interface from scutil so
+                    // traffic accounting and the primary-route badge keep
+                    // working when more than one VPN is connected.
+                    let device = mapping?.device ?? connectedVPNInterfaces[name]
+                    let interface = try device.map(interfaceDetails) ?? (active: false, macAddress: nil)
+                    let kind: NetworkService.Kind = connectedVPNNames.contains(name)
+                        ? .vpn : classify(name: name, hardwarePort: mapping?.port)
+                    let wifiPower: Bool?
+                    let ssid: String?
+                    if kind == .wifi, let device {
+                        let output = try CommandRunner.run(networksetup, ["-getairportpower", device])
+                        wifiPower = output.localizedCaseInsensitiveContains(": On")
+                        let connectionIsEligible = wifiPower == true && interface.active && ip != nil
+                        let outcome: WiFiSSIDReadOutcome
+                        if connectionIsEligible {
+                            do {
+                                let networkOutput = try CommandRunner.run(
+                                    networksetup,
+                                    ["-getairportnetwork", device]
+                                )
+                                outcome = parseCurrentWiFiNetworkOutcome(networkOutput)
+                            } catch {
+                                // A transient subprocess failure is not proof of
+                                // disassociation. Preserve a recent trusted SSID
+                                // rather than flashing the service name for one
+                                // refresh and resetting the traffic baseline.
+                                outcome = .failed
+                            }
+                        } else {
+                            // `-getairportnetwork` can wait several seconds while the radio
+                            // is off or disconnected, so skip it for a faster refresh.
+                            outcome = .current(nil)
+                        }
+                        wifiSSIDCacheLock.lock()
+                        ssid = wifiSSIDCache.resolve(
+                            device: device,
+                            connectionIsEligible: connectionIsEligible,
+                            outcome: outcome,
+                            uptime: ProcessInfo.processInfo.systemUptime
+                        )
+                        wifiSSIDCacheLock.unlock()
                     } else {
-                        // `-getairportnetwork` can wait several seconds while the radio
-                        // is off, so skip it for a much faster initial refresh.
+                        wifiPower = nil
                         ssid = nil
                     }
-                } else {
-                    wifiPower = nil
-                    ssid = nil
+
+                    let dnsOutput = try CommandRunner.run(networksetup, ["-getdnsservers", name])
+
+                    let service = NetworkService(
+                        name: name,
+                        orderIndex: priorityIndex,
+                        hardwarePort: mapping?.port,
+                        device: device,
+                        enabled: enabled,
+                        connected: enabled && ((interface.active && ip != nil) || connectedVPNNames.contains(name)),
+                        ipAddress: ip,
+                        subnetMask: parseValue("Subnet mask", in: info),
+                        router: parseValue("Router", in: info).flatMap(validNetworkValue)
+                            ?? parseValue("IPv6 Router", in: info).flatMap(validNetworkValue),
+                        dnsServers: parseDNSServers(dnsOutput),
+                        macAddress: interface.macAddress,
+                        ssid: ssid,
+                        isPrimary: (device != nil && device == primaryDevice)
+                            || name == primaryVPNName,
+                        kind: kind,
+                        wifiPowered: wifiPower
+                    )
+                    resultLock.lock()
+                    resolvedServices[fallbackIndex] = service
+                    resultLock.unlock()
+                } catch {
+                    resultLock.lock()
+                    if firstDetailError == nil { firstDetailError = error }
+                    resultLock.unlock()
                 }
-
-                let dnsOutput = (try? CommandRunner.run(networksetup, ["-getdnsservers", name])) ?? ""
-
-                let service = NetworkService(
-                    name: name,
-                    orderIndex: priorityIndex,
-                    hardwarePort: mapping?.port,
-                    device: device,
-                    enabled: enabled,
-                    connected: enabled && interface.active && ip != nil,
-                    ipAddress: ip,
-                    subnetMask: parseValue("Subnet mask", in: info),
-                    router: parseValue("Router", in: info).flatMap(validNetworkValue),
-                    dnsServers: parseDNSServers(dnsOutput),
-                    macAddress: interface.macAddress,
-                    ssid: ssid,
-                    isPrimary: device != nil && device == primaryDevice,
-                    kind: kind,
-                    wifiPowered: wifiPower
-                )
-                resultLock.lock()
-                resolvedServices[fallbackIndex] = service
-                resultLock.unlock()
             }
         }
         detailQueue.waitUntilAllOperationsAreFinished()
+        if let firstDetailError { throw firstDetailError }
         return resolvedServices.compactMap { $0 }.sorted { $0.orderIndex < $1.orderIndex }
     }
 
     func fetchTrafficCounters() throws -> [String: InterfaceCounters] {
-        var firstAddress: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&firstAddress) == 0, let firstAddress else {
-            throw NetworkError.commandFailed("读取网络流量计数器失败。")
-        }
-        defer { freeifaddrs(firstAddress) }
-
-        var result: [String: InterfaceCounters] = [:]
-        var cursor: UnsafeMutablePointer<ifaddrs>? = firstAddress
-        while let pointer = cursor {
-            let interface = pointer.pointee
-            if let address = interface.ifa_addr,
-               address.pointee.sa_family == UInt8(AF_LINK),
-               let rawData = interface.ifa_data {
-                let name = String(cString: interface.ifa_name)
-                let data = rawData.assumingMemoryBound(to: if_data.self).pointee
-                result[name] = InterfaceCounters(
-                    receivedBytes: UInt64(data.ifi_ibytes),
-                    sentBytes: UInt64(data.ifi_obytes)
-                )
+        // `getifaddrs().ifa_data` exposes the legacy 32-bit `if_data` byte
+        // counters on macOS. Fast links wrap those values after only 4 GiB,
+        // causing everyday downloads to briefly show zero and lose usage.
+        // NET_RT_IFLIST2 returns `if_data64` without spawning `netstat` every
+        // second, keeping both the rate display and cumulative usage accurate.
+        for _ in 0..<3 {
+            var mib: [Int32] = [CTL_NET, PF_ROUTE, 0, 0, NET_RT_IFLIST2, 0]
+            var byteCount = 0
+            guard sysctl(&mib, u_int(mib.count), nil, &byteCount, nil, 0) == 0,
+                  byteCount > 0 else {
+                throw NetworkError.commandFailed("读取 64 位网络流量计数器失败。")
             }
-            cursor = interface.ifa_next
+            // Route messages contain naturally aligned C structs. Allocate a
+            // matching raw buffer rather than assuming `[UInt8]` alignment.
+            let buffer = UnsafeMutableRawPointer.allocate(
+                byteCount: byteCount,
+                alignment: MemoryLayout<if_msghdr2>.alignment
+            )
+            var writtenByteCount = byteCount
+            let status = sysctl(&mib, u_int(mib.count), buffer, &writtenByteCount, nil, 0)
+            if status != 0 {
+                let failure = errno
+                buffer.deallocate()
+                // The interface list can grow between the size query and read.
+                // Retry with the new size instead of dropping a traffic tick.
+                if failure == ENOMEM { continue }
+                throw NetworkError.commandFailed("读取 64 位网络流量计数器失败。")
+            }
+
+            var result: [String: InterfaceCounters] = [:]
+            var offset = 0
+            while offset + MemoryLayout<if_msghdr>.size <= writtenByteCount {
+                let pointer = buffer.advanced(by: offset)
+                let header = pointer.assumingMemoryBound(to: if_msghdr.self).pointee
+                let messageLength = Int(header.ifm_msglen)
+                guard messageLength > 0, offset + messageLength <= writtenByteCount else { break }
+
+                if Int32(header.ifm_type) == RTM_IFINFO2,
+                   messageLength >= MemoryLayout<if_msghdr2>.size {
+                    let extended = pointer.assumingMemoryBound(to: if_msghdr2.self).pointee
+                    var interfaceName = [CChar](repeating: 0, count: Int(IFNAMSIZ))
+                    if if_indextoname(UInt32(extended.ifm_index), &interfaceName) != nil {
+                        result[String(cString: interfaceName)] = InterfaceCounters(
+                            receivedBytes: extended.ifm_data.ifi_ibytes,
+                            sentBytes: extended.ifm_data.ifi_obytes
+                        )
+                    }
+                }
+                offset += messageLength
+            }
+            buffer.deallocate()
+            guard !result.isEmpty else {
+                throw NetworkError.commandFailed("没有读到可用的网络流量计数器。")
+            }
+            return result
         }
-        return result
+        throw NetworkError.commandFailed("网络接口正在变化，请稍后重试。")
     }
 
     func runDiagnostics() -> NetworkDiagnostic {
-        let routeOutput = (try? CommandRunner.run("/sbin/route", ["-n", "get", "default"])) ?? ""
+        let ipv4Route = try? CommandRunner.run("/sbin/route", ["-n", "get", "default"])
+        let routeOutput = ipv4Route
+            ?? (try? CommandRunner.run("/sbin/route", ["-n", "get", "-inet6", "default"]))
+            ?? ""
         let defaultInterface = parseValue("interface", in: routeOutput)
         let gateway = parseValue("gateway", in: routeOutput)
         let latency: Double?
-        if let gateway,
-           let output = try? CommandRunner.run("/sbin/ping", ["-c", "1", "-W", "1000", gateway]) {
-            latency = parsePingLatency(output)
+        if let gateway {
+            let ping = diagnosticPingInvocation(gateway: gateway)
+            let output = try? CommandRunner.run(ping.executable, ping.arguments, timeout: 2.5)
+            if let output {
+                latency = parsePingLatency(output)
+            } else {
+                latency = nil
+            }
         } else {
             latency = nil
         }
@@ -392,7 +604,7 @@ final class NetworkManager {
             defaultInterface: defaultInterface,
             gateway: gateway,
             gatewayLatencyMilliseconds: latency,
-            dnsLookupSucceeded: dnsLookupOutput.contains("ip_address:"),
+            dnsLookupSucceeded: dnsLookupDidResolve(dnsLookupOutput),
             systemDNSServers: parseSystemDNSServers(dnsOutput)
         )
     }
@@ -406,28 +618,48 @@ final class NetworkManager {
     }
 
     func joinWiFi(device: String, networkName: String, password: String?) throws {
-        var arguments = ["join-wifi", device, networkName]
-        if let password, !password.isEmpty { arguments.append(password) }
-        try privilegedHelper.run(arguments)
+        try Self.coreWLANAccessGate.withAccess {
+            if let password, !password.isEmpty {
+                guard let interface = CWWiFiClient.shared().interface(withName: device) else {
+                    throw NetworkError.commandFailed("未找到 Wi-Fi 设备 \(device)。")
+                }
+                let ssidData = Data(networkName.utf8)
+                let networks = try interface.scanForNetworks(withSSID: ssidData)
+                guard let network = networks.max(by: { $0.rssiValue < $1.rssiValue }) else {
+                    throw NetworkError.commandFailed("未找到“\(networkName)”，请靠近路由器后重试。")
+                }
+                // CoreWLAN keeps the password out of sudo/helper/networksetup argv,
+                // where another local process could otherwise observe it.
+                try interface.associate(to: network, password: password)
+                return
+            }
+            // Open-network association still drives the same radio. Keep it
+            // behind the CoreWLAN gate as well so a timed-out scan cannot race
+            // a networksetup association started from manual entry.
+            let arguments = ["join-wifi", device, networkName]
+            try privilegedHelper.run(arguments)
+        }
     }
 
     func scanWiFiNetworks(device: String, currentSSID: String?) throws -> WiFiScanResult {
-        guard let interface = CWWiFiClient.shared().interface(withName: device) else {
-            throw NetworkError.commandFailed("未找到 Wi-Fi 设备 \(device)。")
-        }
-        let resolvedCurrentSSID = currentSSID ?? interface.ssid()
-        let scanned = try interface.scanForNetworks(withSSID: nil).compactMap { network -> WiFiNetwork? in
-            guard let ssid = network.ssid else { return nil }
-            return WiFiNetwork(
-                ssid: ssid,
-                rssiValue: network.rssiValue,
-                isSecure: !network.supportsSecurity(.none)
+        try Self.coreWLANAccessGate.withAccess {
+            guard let interface = CWWiFiClient.shared().interface(withName: device) else {
+                throw NetworkError.commandFailed("未找到 Wi-Fi 设备 \(device)。")
+            }
+            let resolvedCurrentSSID = interface.ssid() ?? currentSSID
+            let scanned = try interface.scanForNetworks(withSSID: nil).compactMap { network -> WiFiNetwork? in
+                guard let ssid = network.ssid else { return nil }
+                return WiFiNetwork(
+                    ssid: ssid,
+                    rssiValue: network.rssiValue,
+                    isSecure: !network.supportsSecurity(.none)
+                )
+            }
+            return WiFiScanResult(
+                networks: WiFiNetworkCatalog.normalized(scanned, currentSSID: resolvedCurrentSSID),
+                currentSSID: resolvedCurrentSSID
             )
         }
-        return WiFiScanResult(
-            networks: WiFiNetworkCatalog.normalized(scanned, currentSSID: resolvedCurrentSSID),
-            currentSSID: resolvedCurrentSSID
-        )
     }
 
     func renameService(_ oldName: String, to newName: String) throws {
@@ -453,16 +685,27 @@ final class NetworkManager {
         try privilegedHelper.run(["order"] + order)
     }
 
-    /// Enables the chosen physical service first, then disables the other active
-    /// physical services. A Wi-Fi radio is powered on before its service is enabled.
-    func switchToService(_ target: String, otherServices: [String], wifiDevice: String?) throws {
-        try privilegedHelper.run(["switch", target, wifiDevice ?? "-"] + otherServices)
+    /// Enables the chosen physical service and moves it to the front of the
+    /// service order while retaining healthy fallbacks. A Wi-Fi radio is powered
+    /// on before its service is enabled.
+    func switchToService(_ target: String, currentOrder: [String], wifiDevice: String?) throws {
+        guard currentOrder.contains(target), Set(currentOrder).count == currentOrder.count else {
+            throw NetworkError.commandFailed("网络服务顺序已变化，请刷新后重试。")
+        }
+        try privilegedHelper.run(["switch", target, wifiDevice ?? "-"] + currentOrder)
     }
 
     /// Applies an entire saved network state with one administrator authorization.
     /// Fixed shell code consumes every user-visible name as a positional argument.
-    func applyProfile(serviceStates: [String: Bool], wifiPowerStates: [String: Bool]) throws {
+    func applyProfile(
+        serviceStates: [String: Bool],
+        wifiPowerStates: [String: Bool],
+        readinessServices: [String]
+    ) throws {
         var arguments: [String] = ["profile"]
+        for service in readinessServices.sorted() {
+            arguments += ["ready", service, "on"]
+        }
         // Bring radios and services up before taking other services down, reducing
         // the window where the Mac has no usable connection.
         for (device, enabled) in wifiPowerStates.sorted(by: { $0.key < $1.key }) where enabled {
@@ -549,21 +792,56 @@ final class NetworkManager {
         return (lower == "none" || value == "0.0.0.0") ? nil : value
     }
 
+    private func validIPAddressValue(_ value: String) -> String? {
+        let lower = value.lowercased()
+        guard lower != "none", value != "0.0.0.0", value != "::", value != "::1",
+              !value.hasPrefix("127."), !value.hasPrefix("169.254."),
+              !lower.hasPrefix("fe80:") else { return nil }
+        return value
+    }
+
     func parseDNSServers(_ output: String) -> [String] {
         guard !output.localizedCaseInsensitiveContains("aren't any DNS") else { return [] }
         return output
             .split(separator: "\n")
             .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
+            .filter { value in
+                let addressWithoutZone = value.split(separator: "%", maxSplits: 1).first.map(String.init) ?? value
+                return IPv4Address(value) != nil || IPv6Address(addressWithoutZone) != nil
+            }
     }
 
     func parseCurrentWiFiNetwork(_ output: String) -> String? {
-        guard let colon = output.firstIndex(of: ":") else { return nil }
-        let value = String(output[output.index(after: colon)...]).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !value.isEmpty,
-              !value.localizedCaseInsensitiveContains("not associated"),
-              !value.localizedCaseInsensitiveContains("unable") else { return nil }
+        guard case .current(let value) = parseCurrentWiFiNetworkOutcome(output) else {
+            return nil
+        }
         return value
+    }
+
+    func parseCurrentWiFiNetworkOutcome(_ output: String) -> WiFiSSIDReadOutcome {
+        let lowercasedOutput = output.lowercased()
+        if lowercasedOutput.contains("not associated")
+            || lowercasedOutput.contains("unable") {
+            return .current(nil)
+        }
+        guard let colon = output.firstIndex(of: ":") else { return .failed }
+        var rawValue = String(output[output.index(after: colon)...])
+        // networksetup inserts one delimiter space after the colon. Remove only
+        // that byte and line endings; any additional leading/trailing spaces
+        // can be legal SSID bytes and must survive round-tripping.
+        if rawValue.first == " " || rawValue.first == "\t" { rawValue.removeFirst() }
+        let value = rawValue.trimmingCharacters(in: .newlines)
+        guard !value.isEmpty else { return .failed }
+        return .current(value)
+    }
+
+    func diagnosticPingInvocation(gateway: String) -> (executable: String, arguments: [String]) {
+        if gateway.contains(":") {
+            // macOS ping6 uses -W as a flag for a legacy Node Information query;
+            // unlike IPv4 ping it does not accept a millisecond value.
+            return ("/sbin/ping6", ["-c", "1", gateway])
+        }
+        return ("/sbin/ping", ["-c", "1", "-W", "1000", gateway])
     }
 
     func parseTrafficCounters(_ output: String) -> [String: InterfaceCounters] {
@@ -587,6 +865,10 @@ final class NetworkManager {
         return Double(output[range])
     }
 
+    func dnsLookupDidResolve(_ output: String) -> Bool {
+        output.contains("ip_address:") || output.contains("ipv6_address:")
+    }
+
     func parseSystemDNSServers(_ output: String) -> [String] {
         var servers: [String] = []
         for rawLine in output.split(separator: "\n") {
@@ -596,6 +878,61 @@ final class NetworkManager {
             if !value.isEmpty && !servers.contains(value) { servers.append(value) }
         }
         return servers
+    }
+
+    func parseConnectedVPNServiceNames(_ output: String) -> Set<String> {
+        Set(output.split(separator: "\n").compactMap { rawLine in
+            let line = String(rawLine)
+            guard line.contains("(Connected)") else { return nil }
+            let quotedParts = line.components(separatedBy: "\"")
+            guard quotedParts.count >= 3 else { return nil }
+            let name = quotedParts[quotedParts.count - 2]
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return name.isEmpty ? nil : name
+        })
+    }
+
+    func parseVPNInterfaceName(_ output: String) -> String? {
+        for rawLine in output.split(separator: "\n") {
+            let line = String(rawLine).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard line.range(
+                of: #"^InterfaceName\s*[:=]\s*"#,
+                options: .regularExpression
+            ) != nil else { continue }
+            let value = line.replacingOccurrences(
+                of: #"^InterfaceName\s*[:=]\s*"#,
+                with: "",
+                options: .regularExpression
+            ).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard value.range(
+                of: #"^[A-Za-z0-9._-]+$"#,
+                options: .regularExpression
+            ) != nil else { continue }
+            return value
+        }
+        return nil
+    }
+
+    func primaryVPNServiceName(
+        connectedNames: Set<String>,
+        interfacesByName: [String: String],
+        defaultInterface: String?
+    ) -> String? {
+        guard let defaultInterface else { return nil }
+        if let matched = connectedNames.sorted().first(where: {
+            interfacesByName[$0] == defaultInterface
+        }) {
+            return matched
+        }
+        // Older VPN implementations do not always publish InterfaceName. The
+        // single-connected-service fallback is unambiguous for a tunnel route;
+        // with multiple services, leave the primary badge unset rather than
+        // assigning it to the wrong VPN.
+        if connectedNames.count == 1,
+           defaultInterface.hasPrefix("utun") || defaultInterface.hasPrefix("ppp") {
+            return connectedNames.first
+        }
+        return nil
     }
 
     func normalizedDNSServers(_ input: String) throws -> [String] {
@@ -612,23 +949,77 @@ final class NetworkManager {
         return result
     }
 
-    private func interfaceDetails(_ device: String) -> (active: Bool, macAddress: String?) {
-        guard let output = try? CommandRunner.run("/sbin/ifconfig", [device]) else {
-            return (false, nil)
+    private func interfaceDetails(_ device: String) throws -> (active: Bool, macAddress: String?) {
+        let output: String
+        do {
+            output = try CommandRunner.run("/sbin/ifconfig", [device])
+        } catch {
+            // macOS keeps network services for unplugged USB/mobile adapters in
+            // `networksetup`, even though their enX interface no longer exists.
+            // That is a normal offline state, not a reason to discard every
+            // other service in the refresh.
+            if interfaceIsUnavailable(error.localizedDescription) {
+                return (active: false, macAddress: nil)
+            }
+            throw error
         }
-        let mac = output.split(separator: "\n").lazy
+        return parseInterfaceDetails(output)
+    }
+
+    func parseInterfaceDetails(_ output: String) -> (active: Bool, macAddress: String?) {
+        let lines = output.split(separator: "\n").map(String.init)
+        let mac = lines.lazy
             .map { String($0).trimmingCharacters(in: .whitespaces) }
             .first { $0.hasPrefix("ether ") }
             .map { String($0.dropFirst("ether ".count)).trimmingCharacters(in: .whitespaces) }
-        return (output.localizedCaseInsensitiveContains("status: active"), mac)
+        let flagsAreRunning = lines.first.map { line in
+            line.contains("<") && line.contains("UP") && line.contains("RUNNING")
+        } ?? false
+        let explicitStatus = lines.lazy
+            .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+            .first { $0.hasPrefix("status:") }
+        // Some virtual interfaces omit the status line and must fall back to
+        // UP/RUNNING flags. An explicit `status: inactive` always wins.
+        let active = explicitStatus.map { $0 == "status: active" } ?? flagsAreRunning
+        return (active, mac)
+    }
+
+    func interfaceIsUnavailable(_ errorMessage: String) -> Bool {
+        let message = errorMessage.lowercased()
+        return message.contains("interface")
+            && (message.contains("does not exist") || message.contains("no such interface"))
     }
 
     private func defaultRouteInterface() -> String? {
-        guard let output = try? CommandRunner.run("/sbin/route", ["-n", "get", "default"]) else { return nil }
+        if let output = try? CommandRunner.run("/sbin/route", ["-n", "get", "default"]),
+           let interface = parseValue("interface", in: output) {
+            return interface
+        }
+        guard let output = try? CommandRunner.run("/sbin/route", ["-n", "get", "-inet6", "default"]) else {
+            return nil
+        }
         return parseValue("interface", in: output)
     }
 
-    private func classify(name: String, hardwarePort: String?) -> NetworkService.Kind {
+    private func activeVPNServiceNames() -> Set<String> {
+        guard let output = try? CommandRunner.run("/usr/sbin/scutil", ["--nc", "list"]) else { return [] }
+        return parseConnectedVPNServiceNames(output)
+    }
+
+    private func activeVPNInterfaceNames(for serviceNames: Set<String>) -> [String: String] {
+        var result: [String: String] = [:]
+        for name in serviceNames.sorted() {
+            guard let output = try? CommandRunner.run(
+                "/usr/sbin/scutil",
+                ["--nc", "show", name],
+                timeout: 3
+            ), let interface = parseVPNInterfaceName(output) else { continue }
+            result[name] = interface
+        }
+        return result
+    }
+
+    func classify(name: String, hardwarePort: String?) -> NetworkService.Kind {
         let text = "\(name) \(hardwarePort ?? "")".lowercased()
         if text.contains("wi-fi") || text.contains("wifi") || text.contains("airport") {
             return .wifi
@@ -638,6 +1029,10 @@ final class NetworkManager {
         }
         if text.contains("vpn") || text.contains("ppp") || text.contains("ipsec") {
             return .vpn
+        }
+        if text.contains("cellular") || text.contains("mobile") || text.contains("wwan")
+            || text.contains("broadband") || text.contains("modem") {
+            return .cellular
         }
         return .other
     }
