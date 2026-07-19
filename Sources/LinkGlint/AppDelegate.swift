@@ -62,7 +62,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
     private let pathMonitor = NWPathMonitor()
     private let pathMonitorQueue = DispatchQueue(label: "local.codex.LinkGlint.path-monitor")
     private var pendingPathRefresh: DispatchWorkItem?
-    private var isRefreshing = false
+    private var refreshRequests = RefreshRequestCoalescer()
     private var isPerformingPrivilegedChange = false
     private var isApplyingServiceSwitch = false
     private var isConfiguringPrivilegedAccess = false
@@ -220,24 +220,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
     }
 
     private func performRefresh(showingErrors: Bool) {
-        guard !isRefreshing,
-              !isApplyingServiceSwitch,
+        guard !isApplyingServiceSwitch,
               !isPerformingPrivilegedChange,
               !isConfiguringPrivilegedAccess else { return }
-        isRefreshing = true
-        let generation = networkStateGeneration
+        guard refreshRequests.request(showingErrors: showingErrors) else { return }
+        startNetworkRefresh(showingErrors: showingErrors)
+    }
 
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+    private func startNetworkRefresh(showingErrors: Bool) {
+        let generation = networkStateGeneration
+        let qos: DispatchQoS.QoSClass = showingErrors ? .userInitiated : .utility
+
+        DispatchQueue.global(qos: qos).async { [weak self] in
             guard let self else { return }
             do {
                 let services = try self.manager.fetchServices()
                 let accessState = self.manager.privilegedAccessState
                 DispatchQueue.main.async {
-                    self.isRefreshing = false
                     guard generation == self.networkStateGeneration else {
                         if !self.isApplyingServiceSwitch, !self.isPerformingPrivilegedChange {
-                            self.performRefresh(showingErrors: showingErrors)
+                            _ = self.refreshRequests.request(showingErrors: showingErrors)
                         }
+                        self.completeNetworkRefresh()
                         return
                     }
                     self.hasLoadedNetworkState = true
@@ -258,15 +262,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
                         // reconstructing every menu, card and Auto Layout tree.
                         self.updateStatusIcon(services)
                     }
-                    self.sampleTraffic()
+                    // The traffic timer owns steady-state sampling. Only prime
+                    // the baseline or react immediately to a topology change;
+                    // otherwise this 12-second refresh would add jittery,
+                    // redundant samples between regular timer ticks.
+                    if self.previousTrafficSampleDate == nil || servicesChanged {
+                        self.sampleTraffic()
+                    }
+                    self.completeNetworkRefresh()
                 }
             } catch {
                 DispatchQueue.main.async {
-                    self.isRefreshing = false
                     guard generation == self.networkStateGeneration else {
                         if !self.isApplyingServiceSwitch, !self.isPerformingPrivilegedChange {
-                            self.performRefresh(showingErrors: showingErrors)
+                            _ = self.refreshRequests.request(showingErrors: showingErrors)
                         }
+                        self.completeNetworkRefresh()
                         return
                     }
                     if showingErrors {
@@ -274,8 +285,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
                     } else {
                         self.setOperationFeedback("状态刷新失败，稍后重试", color: .systemOrange, clearAfter: 3)
                     }
+                    self.completeNetworkRefresh()
                 }
             }
+        }
+    }
+
+    private func completeNetworkRefresh() {
+        if let showingErrors = refreshRequests.finish() {
+            startNetworkRefresh(showingErrors: showingErrors)
         }
     }
 
@@ -1132,7 +1150,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
                     )
                     for (device, delta) in sample.deltasByDevice {
                         if self.mainWindow?.isVisible == true, let label = self.trafficLabels[device] {
-                            label.stringValue = "↓ \(self.formatRate(Double(delta.receivedBytes) / interval))   ↑ \(self.formatRate(Double(delta.sentBytes) / interval))"
+                            let text = "↓ \(self.formatRate(Double(delta.receivedBytes) / interval))   ↑ \(self.formatRate(Double(delta.sentBytes) / interval))"
+                            if label.stringValue != text { label.stringValue = text }
                         }
                     }
                     self.usageTracker.record(
@@ -1148,7 +1167,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
                         at: sampleDate
                     )
                     if self.statusPanelIsOpen {
-                        self.statusPanelTrafficRatesLabel?.attributedStringValue = self.statusPanelTrafficRateText
+                        if let label = self.statusPanelTrafficRatesLabel {
+                            let text = self.statusPanelTrafficRateText
+                            if !label.attributedStringValue.isEqual(to: text) {
+                                label.attributedStringValue = text
+                            }
+                        }
                         self.statusPanelTrafficChart?.samples = self.trafficRateHistory.samples
                     }
                     self.updateUsageDisplay()
@@ -1219,7 +1243,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
             )
             button.imagePosition = .imageOnly
             button.imageScaling = .scaleNone
-            statusItem.length = ceil(button.image?.size.width ?? NSStatusItem.squareLength) + 8
+            // The rendered image already contains the icon box and its text
+            // spacing. Adding another status-item inset here leaves a visible
+            // empty block before the next macOS menu-bar item.
+            statusItem.length = max(
+                NSStatusItem.squareLength,
+                ceil(button.image?.size.width ?? NSStatusItem.squareLength)
+            )
         } else {
             let title = menuBarAttributedTitle(presentation.text, indicatorStyle: indicatorStyle)
             button.attributedTitle = title
@@ -2330,11 +2360,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
     private func updateUsageDisplay() {
         let today = usageTracker.usage()
         let text = "今日记录  ↓ \(formatBytes(today.receivedBytes))   ↑ \(formatBytes(today.sentBytes))"
-        if mainWindow?.isVisible == true { usageLabel?.stringValue = text }
-        if statusPopover.isShown {
-            statusPanelUsageLabel?.stringValue = "今日记录 ↓ \(formatBytes(today.receivedBytes))  ↑ \(formatBytes(today.sentBytes))"
+        if mainWindow?.isVisible == true, usageLabel?.stringValue != text {
+            usageLabel?.stringValue = text
         }
-        statusContextUsageItem?.title = "今日记录：↓ \(formatBytes(today.receivedBytes)) · ↑ \(formatBytes(today.sentBytes))"
+        if statusPopover.isShown {
+            let panelText = "今日记录 ↓ \(formatBytes(today.receivedBytes))  ↑ \(formatBytes(today.sentBytes))"
+            if statusPanelUsageLabel?.stringValue != panelText {
+                statusPanelUsageLabel?.stringValue = panelText
+            }
+        }
+        let menuText = "今日记录：↓ \(formatBytes(today.receivedBytes)) · ↑ \(formatBytes(today.sentBytes))"
+        if statusContextUsageItem?.title != menuText {
+            statusContextUsageItem?.title = menuText
+        }
     }
 
     @objc private func resetTodayUsage() {

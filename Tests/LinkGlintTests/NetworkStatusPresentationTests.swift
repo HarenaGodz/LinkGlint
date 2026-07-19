@@ -2,6 +2,28 @@ import XCTest
 @testable import LinkGlint
 
 final class NetworkStatusPresentationTests: XCTestCase {
+    func testRefreshRequestsAreCoalescedIntoOneFollowUp() {
+        var coalescer = RefreshRequestCoalescer()
+
+        XCTAssertTrue(coalescer.request(showingErrors: false))
+        XCTAssertFalse(coalescer.request(showingErrors: false))
+        XCTAssertFalse(coalescer.request(showingErrors: false))
+        XCTAssertEqual(coalescer.finish(), false)
+        XCTAssertTrue(coalescer.isRunning)
+        XCTAssertNil(coalescer.finish())
+        XCTAssertFalse(coalescer.isRunning)
+    }
+
+    func testUserRefreshUpgradesPendingBackgroundRefresh() {
+        var coalescer = RefreshRequestCoalescer()
+
+        XCTAssertTrue(coalescer.request(showingErrors: false))
+        XCTAssertFalse(coalescer.request(showingErrors: false))
+        XCTAssertFalse(coalescer.request(showingErrors: true))
+        XCTAssertEqual(coalescer.finish(), true)
+        XCTAssertNil(coalescer.finish())
+    }
+
     func testStatusPanelClickInteractionIsDeterministic() {
         XCTAssertEqual(
             StatusPanelInteraction.action(for: .left, panelIsOpen: false),

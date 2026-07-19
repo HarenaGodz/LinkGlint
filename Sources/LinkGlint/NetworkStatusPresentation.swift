@@ -22,6 +22,34 @@ struct StatusPanelInteraction {
     }
 }
 
+/// Collapses bursts of refresh requests into at most one follow-up operation.
+/// A user-initiated request upgrades an already queued background refresh so
+/// that errors are still surfaced when the follow-up runs.
+struct RefreshRequestCoalescer {
+    private(set) var isRunning = false
+    private var pendingShowsErrors: Bool?
+
+    mutating func request(showingErrors: Bool) -> Bool {
+        guard isRunning else {
+            isRunning = true
+            return true
+        }
+        pendingShowsErrors = (pendingShowsErrors ?? false) || showingErrors
+        return false
+    }
+
+    /// Finishes the active operation and returns the coalesced follow-up, if
+    /// any. While a follow-up exists the coordinator remains in a running state.
+    mutating func finish() -> Bool? {
+        guard let pendingShowsErrors else {
+            isRunning = false
+            return nil
+        }
+        self.pendingShowsErrors = nil
+        return pendingShowsErrors
+    }
+}
+
 enum MenuBarTrafficIndicatorStyle: String, CaseIterable, Equatable {
     case coloredDots
     case coloredTriangles
