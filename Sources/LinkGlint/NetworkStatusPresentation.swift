@@ -1,5 +1,88 @@
 import Foundation
 
+enum NetworkDisplayText {
+    static func singleLine(_ value: String, fallback: String = "未命名") -> String {
+        let forbidden = CharacterSet.controlCharacters.union(.newlines)
+        let sanitized = value.unicodeScalars.map {
+            forbidden.contains($0) ? "�" : String($0)
+        }.joined()
+        return sanitized.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? fallback : sanitized
+    }
+
+    static func compact(_ value: String, maximumCharacters: Int = 9) -> String {
+        let singleLineValue = singleLine(value)
+        let limit = max(maximumCharacters, 1)
+        guard singleLineValue.count > limit else { return singleLineValue }
+        let prefixLength = max(limit - 1, 0)
+        return String(singleLineValue.prefix(prefixLength))
+            .trimmingCharacters(in: .whitespaces) + "…"
+    }
+}
+
+enum NetworkServiceSummaryText {
+    static func panel(services: [NetworkService]) -> String {
+        let connectedCount = services.filter(\.connected).count
+        let enabledCount = services.filter(\.enabled).count
+        let activeName = services.first(where: { $0.isPrimary && $0.connected })?.name
+            ?? services.first(where: \.connected)?.name
+        var parts = ["\(connectedCount) 个已连接", "\(enabledCount) 个已启用"]
+        if let activeName {
+            parts.insert(NetworkDisplayText.singleLine(activeName), at: 0)
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    static func mainWindow(services: [NetworkService]) -> String {
+        let connectedCount = services.filter(\.connected).count
+        let enabledCount = services.filter(\.enabled).count
+        return "\(services.count) 个服务 · \(connectedCount) 个已连接 · \(enabledCount) 个已启用"
+    }
+}
+
+struct NetworkDiagnosticPresentation: Equatable {
+    let title: String
+    let detail: String
+    let isHealthy: Bool?
+
+    static func make(_ diagnostic: NetworkDiagnostic?) -> NetworkDiagnosticPresentation {
+        guard let diagnostic else {
+            return .init(
+                title: "网络检测",
+                detail: "检查默认路由、网关延迟与 DNS",
+                isHealthy: nil
+            )
+        }
+        var details = [diagnostic.summary]
+        if let latency = diagnostic.gatewayLatencyMilliseconds {
+            details.append(String(format: "网关 %.1f ms", latency))
+        }
+        details.append(diagnostic.dnsLookupSucceeded ? "DNS 正常" : "DNS 异常")
+        return .init(
+            title: diagnostic.isUsable ? "网络良好" : "需要检查",
+            detail: details.joined(separator: " · "),
+            isHealthy: diagnostic.isUsable
+        )
+    }
+}
+
+enum TrafficHistoryWindowFormatter {
+    static func string(samples: [TrafficRateSample]) -> String {
+        guard samples.count > 1, let first = samples.first, let last = samples.last else {
+            return samples.isEmpty ? "等待样本" : "1 个样本"
+        }
+        let seconds = max(last.date.timeIntervalSince(first.date), 0)
+        if seconds < 60 {
+            return "近 \(max(Int(seconds.rounded()), 1)) 秒"
+        }
+        let minutes = seconds / 60
+        if minutes < 10 {
+            return String(format: "近 %.1f 分钟", minutes)
+        }
+        return "近 \(Int(minutes.rounded())) 分钟"
+    }
+}
+
 enum StatusPanelClick: Equatable {
     case left
     case right
@@ -75,21 +158,17 @@ struct NetworkStatusPresentation: Equatable {
                 ?? services.first(where: \.connected) else {
             return .init(title: "离线", symbolName: "network.slash")
         }
-        func compact(_ value: String) -> String {
-            guard value.count > 9 else { return value }
-            return String(value.prefix(8)).trimmingCharacters(in: .whitespaces) + "…"
-        }
         switch active.kind {
         case .wifi:
-            return .init(title: "无线·\(compact(active.ssid ?? active.name))", symbolName: "wifi")
+            return .init(title: "无线·\(NetworkDisplayText.compact(active.ssid ?? active.name))", symbolName: "wifi")
         case .ethernet:
-            return .init(title: "有线·\(compact(active.name))", symbolName: "cable.connector")
+            return .init(title: "有线·\(NetworkDisplayText.compact(active.name))", symbolName: "cable.connector")
         case .cellular:
-            return .init(title: "移动·\(compact(active.name))", symbolName: "antenna.radiowaves.left.and.right")
+            return .init(title: "移动·\(NetworkDisplayText.compact(active.name))", symbolName: "antenna.radiowaves.left.and.right")
         case .vpn:
-            return .init(title: "VPN·\(compact(active.name))", symbolName: "lock.shield")
+            return .init(title: "VPN·\(NetworkDisplayText.compact(active.name))", symbolName: "lock.shield")
         case .other:
-            return .init(title: "其他·\(compact(active.name))", symbolName: "network")
+            return .init(title: "其他·\(NetworkDisplayText.compact(active.name))", symbolName: "network")
         }
     }
 }

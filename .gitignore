@@ -13,6 +13,9 @@ xcuserdata/
 *.xcuserstate
 DerivedData/
 
+# Local editor settings
+.vscode/
+
 # Local build and regression artifacts
 dist/
 outputs/

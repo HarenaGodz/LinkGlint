@@ -194,7 +194,7 @@ final class WiFiPickerViewController: NSViewController, NSTextFieldDelegate, NST
         footer.orientation = .horizontal
         footer.alignment = .centerY
         install(
-            title: "正在连接“\(ssid)”",
+            title: "正在连接“\(NetworkDisplayText.singleLine(ssid))”",
             subtitle: "现有连接会保留到目标网络就绪",
             body: body,
             footer: footer,
@@ -268,7 +268,7 @@ final class WiFiPickerViewController: NSViewController, NSTextFieldDelegate, NST
         footer.alignment = .centerY
 
         install(
-            title: ssid.map { "连接“\($0)”" } ?? "连接其他网络",
+            title: ssid.map { "连接“\(NetworkDisplayText.singleLine($0))”" } ?? "连接其他网络",
             subtitle: isSecure ? "此网络需要密码" : "手动输入网络信息",
             body: content,
             footer: footer,
@@ -292,9 +292,11 @@ final class WiFiPickerViewController: NSViewController, NSTextFieldDelegate, NST
         card.fillColor = isCurrent ? NSColor.systemGreen.withAlphaComponent(0.08) : NSColor.controlBackgroundColor.withAlphaComponent(0.32)
 
         let wifi = symbolView("wifi", color: signalColor(network.rssiValue), size: 17)
-        let name = NSTextField(labelWithString: network.ssid)
+        let displaySSID = NetworkDisplayText.singleLine(network.ssid)
+        let name = NSTextField(labelWithString: displaySSID)
         name.font = .systemFont(ofSize: 12.5, weight: .medium)
         name.lineBreakMode = .byTruncatingTail
+        name.toolTip = displaySSID
         let security = network.isSecure ? "已加密" : "开放网络"
         let detail = secondaryLabel("\(network.signalDescription) · \(security)")
         detail.font = .systemFont(ofSize: 9.5)
@@ -320,7 +322,7 @@ final class WiFiPickerViewController: NSViewController, NSTextFieldDelegate, NST
         action.isBordered = false
         action.focusRingType = .none
         action.isEnabled = !isCurrent
-        action.setAccessibilityLabel(isCurrent ? "\(network.ssid)，当前已连接" : "连接 \(network.ssid)")
+        action.setAccessibilityLabel(isCurrent ? "\(displaySSID)，当前已连接" : "连接 \(displaySSID)")
         action.translatesAutoresizingMaskIntoConstraints = false
         card.contentView?.addSubview(action)
         NSLayoutConstraint.activate([

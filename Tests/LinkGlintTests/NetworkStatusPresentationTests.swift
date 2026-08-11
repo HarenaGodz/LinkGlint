@@ -280,6 +280,64 @@ final class NetworkStatusPresentationTests: XCTestCase {
         XCTAssertEqual(value, .init(title: "无线·Office", symbolName: "wifi"))
     }
 
+    func testNetworkPresentationKeepsUntrustedNamesOnOneLine() {
+        let value = NetworkStatusPresentation.make(
+            services: [service(kind: .wifi, ssid: "A\nB\tC", primary: true)],
+            hasLoaded: true
+        )
+        XCTAssertEqual(value, .init(title: "无线·A�B�C", symbolName: "wifi"))
+        XCTAssertFalse(value.title.contains("\n"))
+        XCTAssertFalse(value.title.contains("\t"))
+    }
+
+    func testBlankNetworkNameGetsReadableFallback() {
+        let value = NetworkStatusPresentation.make(
+            services: [service(kind: .wifi, ssid: "   ", primary: true)],
+            hasLoaded: true
+        )
+        XCTAssertEqual(value, .init(title: "无线·未命名", symbolName: "wifi"))
+    }
+
+    func testServiceSummariesKeepTheActiveNetworkVisibleAfterFeedbackClears() {
+        let services = [
+            service(kind: .wifi, ssid: "Office", primary: true),
+            service(kind: .ethernet, primary: false)
+        ]
+        XCTAssertEqual(
+            NetworkServiceSummaryText.panel(services: services),
+            "测试服务 · 2 个已连接 · 2 个已启用"
+        )
+        XCTAssertEqual(
+            NetworkServiceSummaryText.mainWindow(services: services),
+            "2 个服务 · 2 个已连接 · 2 个已启用"
+        )
+    }
+
+    func testDiagnosticPresentationAndTrafficWindowAreReadable() {
+        XCTAssertEqual(
+            NetworkDiagnosticPresentation.make(nil),
+            .init(title: "网络检测", detail: "检查默认路由、网关延迟与 DNS", isHealthy: nil)
+        )
+        let diagnostic = NetworkDiagnostic(
+            date: Date(timeIntervalSince1970: 1),
+            defaultInterface: "en0",
+            gateway: "192.0.2.1",
+            gatewayLatencyMilliseconds: 8.4,
+            dnsLookupSucceeded: true,
+            systemDNSServers: ["192.0.2.53"]
+        )
+        XCTAssertEqual(
+            NetworkDiagnosticPresentation.make(diagnostic),
+            .init(title: "网络良好", detail: "网络状态良好 · 网关 8.4 ms · DNS 正常", isHealthy: true)
+        )
+        let start = Date(timeIntervalSince1970: 100)
+        let samples = [
+            TrafficRateSample(date: start, downloadBytesPerSecond: 10, uploadBytesPerSecond: 1),
+            TrafficRateSample(date: start.addingTimeInterval(125), downloadBytesPerSecond: 20, uploadBytesPerSecond: 2)
+        ]
+        XCTAssertEqual(TrafficHistoryWindowFormatter.string(samples: samples), "近 2.1 分钟")
+    }
+
     func testPrimaryEthernetWinsOverAnotherConnectedService() {
         let value = NetworkStatusPresentation.make(
             services: [
