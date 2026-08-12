@@ -50,6 +50,11 @@ final class NetworkStatusPresentationTests: XCTestCase {
         )
     }
 
+    func testPinnedStatusPanelIgnoresExternalDismissal() {
+        XCTAssertTrue(StatusPanelDismissalPolicy.dismissesForExternalInteraction(isPinned: false))
+        XCTAssertFalse(StatusPanelDismissalPolicy.dismissesForExternalInteraction(isPinned: true))
+    }
+
     func testMenuBarTrafficSupportsSingleAndTwoLineLayouts() {
         XCTAssertEqual(
             MenuBarTrafficPresentation.make(
@@ -352,7 +357,7 @@ final class NetworkStatusPresentationTests: XCTestCase {
     func testVPNAndOtherPresentationsIncludeServiceName() {
         XCTAssertEqual(
             NetworkStatusPresentation.make(services: [service(kind: .vpn, primary: true)], hasLoaded: true),
-            .init(title: "VPN·测试服务", symbolName: "lock.shield")
+            .init(title: "VPN·测试服务·已开启", symbolName: "network", vpnConnected: true)
         )
         XCTAssertEqual(
             NetworkStatusPresentation.make(services: [service(kind: .other, primary: true)], hasLoaded: true),
@@ -368,6 +373,32 @@ final class NetworkStatusPresentationTests: XCTestCase {
             ),
             .init(title: "移动·测试服务", symbolName: "antenna.radiowaves.left.and.right")
         )
+    }
+
+    func testConnectedSecondaryVPNIsVisibleAlongsidePhysicalNetwork() {
+        let value = NetworkStatusPresentation.make(
+            services: [
+                service(kind: .wifi, ssid: "Office", primary: true),
+                service(kind: .vpn, primary: false)
+            ],
+            hasLoaded: true
+        )
+
+        XCTAssertEqual(value.title, "无线·Office · VPN·已开启")
+        XCTAssertEqual(value.symbolName, "wifi")
+        XCTAssertTrue(value.vpnConnected)
+    }
+
+    func testNetworkExtensionTunnelIsVisibleWithoutANetworkService() {
+        let value = NetworkStatusPresentation.make(
+            services: [service(kind: .wifi, ssid: "Office", primary: true)],
+            hasLoaded: true,
+            activeVPNInterfaceNames: ["utun4"]
+        )
+
+        XCTAssertEqual(value.title, "无线·Office · VPN·已开启")
+        XCTAssertEqual(value.symbolName, "wifi")
+        XCTAssertTrue(value.vpnConnected)
     }
 
     func testLongNetworkNameIsKeptButCompact() {

@@ -2,6 +2,24 @@ import XCTest
 @testable import LinkGlint
 
 final class PrivilegedHelperManagerTests: XCTestCase {
+    func testAccessGuidanceDistinguishesFirstRunFromLostConfiguration() {
+        XCTAssertEqual(
+            PrivilegedAccessGuidance.make(state: .notConfigured, wasPreviouslyConfigured: false),
+            .firstRun
+        )
+        XCTAssertEqual(
+            PrivilegedAccessGuidance.make(state: .notConfigured, wasPreviouslyConfigured: true),
+            .repair
+        )
+        XCTAssertEqual(
+            PrivilegedAccessGuidance.make(state: .needsRepair, wasPreviouslyConfigured: false),
+            .repair
+        )
+        XCTAssertEqual(
+            PrivilegedAccessGuidance.make(state: .ready, wasPreviouslyConfigured: true),
+            .none
+        )
+    }
     func testConfigurationCacheExpiresUsingMonotonicUptime() {
         var uptime: TimeInterval = 100
         var resolutionCount = 0

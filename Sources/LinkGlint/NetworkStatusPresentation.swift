@@ -105,6 +105,12 @@ struct StatusPanelInteraction {
     }
 }
 
+enum StatusPanelDismissalPolicy {
+    static func dismissesForExternalInteraction(isPinned: Bool) -> Bool {
+        !isPinned
+    }
+}
+
 /// Collapses bursts of refresh requests into at most one follow-up operation.
 /// A user-initiated request upgrades an already queued background refresh so
 /// that errors are still surfaced when the follow-up runs.
@@ -151,25 +157,66 @@ enum MenuBarTrafficIndicatorStyle: String, CaseIterable, Equatable {
 struct NetworkStatusPresentation: Equatable {
     let title: String
     let symbolName: String
+    let vpnConnected: Bool
 
-    static func make(services: [NetworkService], hasLoaded: Bool) -> NetworkStatusPresentation {
+    init(title: String, symbolName: String, vpnConnected: Bool = false) {
+        self.title = title
+        self.symbolName = symbolName
+        self.vpnConnected = vpnConnected
+    }
+
+    static func make(
+        services: [NetworkService],
+        hasLoaded: Bool,
+        activeVPNInterfaceNames: Set<String> = []
+    ) -> NetworkStatusPresentation {
         guard hasLoaded else { return .init(title: "检测中", symbolName: "network") }
         guard let active = services.first(where: { $0.isPrimary && $0.connected })
                 ?? services.first(where: \.connected) else {
             return .init(title: "离线", symbolName: "network.slash")
         }
+        let base: NetworkStatusPresentation
         switch active.kind {
         case .wifi:
-            return .init(title: "无线·\(NetworkDisplayText.compact(active.ssid ?? active.name))", symbolName: "wifi")
+            base = .init(title: "无线·\(NetworkDisplayText.compact(active.ssid ?? active.name))", symbolName: "wifi")
         case .ethernet:
-            return .init(title: "有线·\(NetworkDisplayText.compact(active.name))", symbolName: "cable.connector")
+            base = .init(title: "有线·\(NetworkDisplayText.compact(active.name))", symbolName: "cable.connector")
         case .cellular:
-            return .init(title: "移动·\(NetworkDisplayText.compact(active.name))", symbolName: "antenna.radiowaves.left.and.right")
+            base = .init(title: "移动·\(NetworkDisplayText.compact(active.name))", symbolName: "antenna.radiowaves.left.and.right")
         case .vpn:
-            return .init(title: "VPN·\(NetworkDisplayText.compact(active.name))", symbolName: "lock.shield")
+            let physicalSymbol = services.first(where: {
+                $0.connected && $0.isPhysicalTransport
+            }).map { transport -> String in
+                switch transport.kind {
+                case .wifi: return "wifi"
+                case .ethernet: return "cable.connector"
+                case .cellular: return "antenna.radiowaves.left.and.right"
+                default: return "network"
+                }
+            } ?? "network"
+            base = .init(
+                title: "VPN·\(NetworkDisplayText.compact(active.name))·已开启",
+                symbolName: physicalSymbol,
+                vpnConnected: true
+            )
         case .other:
-            return .init(title: "其他·\(NetworkDisplayText.compact(active.name))", symbolName: "network")
+            base = .init(title: "其他·\(NetworkDisplayText.compact(active.name))", symbolName: "network")
         }
+        guard active.kind != .vpn else {
+            return base
+        }
+        let vpnConnected = services.contains(where: { $0.connected && $0.kind == .vpn })
+            || !activeVPNInterfaceNames.isEmpty
+        guard vpnConnected else { return base }
+        // A split-tunnel or secondary VPN can be connected without becoming
+        // the default route. Keep the physical network name, but make the VPN
+        // state visible in the menu bar while preserving the physical network
+        // symbol. The renderer adds a small lock badge beside that symbol.
+        return .init(
+            title: "\(base.title) · VPN·已开启",
+            symbolName: base.symbolName,
+            vpnConnected: true
+        )
     }
 }
 

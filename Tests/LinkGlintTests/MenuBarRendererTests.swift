@@ -117,4 +117,28 @@ final class MenuBarRendererTests: XCTestCase {
         XCTAssertEqual(MenuBarRenderContext.preview.downloadBytesPerSecond, 1_250_000)
         XCTAssertEqual(MenuBarRenderContext.preview.uploadBytesPerSecond, 42_000)
     }
+
+    func testVPNPreviewPreservesNetworkSymbolSpaceAndAddsBadgeSpace() throws {
+        let renderer = MenuBarRenderer()
+        let appearance = try XCTUnwrap(NSAppearance(named: .aqua))
+        let base = MenuBarRenderContext.preview
+        let vpn = MenuBarRenderContext(
+            symbolName: base.symbolName,
+            networkTitle: "\(base.networkTitle) · VPN·已开启",
+            vpnConnected: true,
+            downloadBytesPerSecond: base.downloadBytesPerSecond,
+            uploadBytesPerSecond: base.uploadBytesPerSecond,
+            showsNetworkTitle: base.showsNetworkTitle,
+            showsSpeed: base.showsSpeed,
+            usesTwoLines: base.usesTwoLines,
+            usesBits: base.usesBits,
+            indicatorStyle: base.indicatorStyle,
+            panelIsOpen: false
+        )
+
+        let baseImage = try XCTUnwrap(renderer.renderPreview(context: base, appearance: appearance))
+        let vpnImage = try XCTUnwrap(renderer.renderPreview(context: vpn, appearance: appearance))
+        XCTAssertGreaterThan(vpnImage.size.width, baseImage.size.width)
+        XCTAssertEqual(vpnImage.accessibilityDescription, "无线·Office · VPN·已开启，↓1.2 MB/s  ↑42 KB/s")
+    }
 }

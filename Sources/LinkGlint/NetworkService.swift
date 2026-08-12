@@ -154,6 +154,112 @@ struct InterfaceCounters: Equatable {
     let sentBytes: UInt64
 }
 
+struct ProcessTrafficCounters: Equatable {
+    let receivedBytes: UInt64
+    let sentBytes: UInt64
+}
+
+enum PublicIPAddressParser {
+    static func parse(_ output: String) -> String? {
+        let value = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return nil }
+        if IPv4Address(value) != nil || IPv6Address(value) != nil { return value }
+        return nil
+    }
+}
+
+struct PublicIPInfo: Equatable {
+    let address: String
+    let countryCode: String?
+}
+
+enum PublicIPInfoParser {
+    static func parse(_ output: String) -> PublicIPInfo? {
+        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let data = trimmed.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let rawIP = json["ip"] as? String,
+              let address = PublicIPAddressParser.parse(rawIP) else { return nil }
+        let countryCode = Self.normalizedCountryCode(json["country"] as? String)
+        return PublicIPInfo(address: address, countryCode: countryCode)
+    }
+
+    private static func normalizedCountryCode(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let code = raw.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard code.count == 2, code.unicodeScalars.allSatisfy({ CharacterSet.letters.contains($0) }) else {
+            return nil
+        }
+        return code
+    }
+}
+
+enum PublicIPDisplayFormatter {
+    /// Mainland-compliance overrides: never present TW/HK/MO as independent states,
+    /// and never emit the Taiwan flag emoji.
+    private static let sensitiveRegionDisplays: [String: (flag: String, name: String)] = [
+        "CN": ("🇨🇳", "中国"),
+        "TW": ("🇨🇳", "中国台湾"),
+        "HK": ("🇨🇳", "中国香港"),
+        "MO": ("🇨🇳", "中国澳门")
+    ]
+
+    static func string(address: String, countryCode: String?) -> String {
+        guard let countryCode else { return address }
+        if let override = sensitiveRegionDisplays[countryCode] {
+            return "\(address) · \(override.flag) \(override.name)"
+        }
+        guard Locale.Region.isoRegions.contains(Locale.Region(countryCode)),
+              let name = Locale(identifier: "zh_CN").localizedString(forRegionCode: countryCode),
+              !name.isEmpty,
+              let flag = flagEmoji(for: countryCode) else {
+            return address
+        }
+        return "\(address) · \(flag) \(name)"
+    }
+
+    static func flagEmoji(for countryCode: String) -> String? {
+        if sensitiveRegionDisplays[countryCode] != nil {
+            return sensitiveRegionDisplays[countryCode]?.flag
+        }
+        let scalars = countryCode.uppercased().unicodeScalars.compactMap { scalar -> Unicode.Scalar? in
+            guard CharacterSet.uppercaseLetters.contains(scalar),
+                  let value = Unicode.Scalar(127397 + scalar.value) else { return nil }
+            return value
+        }
+        guard scalars.count == 2 else { return nil }
+        return String(String.UnicodeScalarView(scalars))
+    }
+}
+
+enum ProcessTrafficParser {
+    static func parse(_ output: String) -> [String: ProcessTrafficCounters] {
+        let rows = output.split(whereSeparator: \.isNewline)
+        guard let header = rows.first?.split(separator: ",", omittingEmptySubsequences: false),
+              let receivedIndex = header.firstIndex(of: "bytes_in"),
+              let sentIndex = header.firstIndex(of: "bytes_out") else { return [:] }
+        var result: [String: ProcessTrafficCounters] = [:]
+        for row in rows.dropFirst() {
+            let fields = row.split(separator: ",", omittingEmptySubsequences: false)
+            guard fields.count > max(receivedIndex, sentIndex), fields.count > 1,
+                  let received = UInt64(fields[receivedIndex].trimmingCharacters(in: .whitespaces)),
+                  let sent = UInt64(fields[sentIndex].trimmingCharacters(in: .whitespaces)) else { continue }
+            let rawName = fields[1].trimmingCharacters(in: .whitespaces)
+            guard !rawName.isEmpty else { continue }
+            let name = rawName.split(separator: ".").last.map(String.init).flatMap { Int($0) } != nil
+                ? String(rawName[..<(rawName.lastIndex(of: ".") ?? rawName.endIndex)])
+                : rawName
+            let old = result[name] ?? ProcessTrafficCounters(receivedBytes: 0, sentBytes: 0)
+            result[name] = ProcessTrafficCounters(
+                receivedBytes: old.receivedBytes > UInt64.max - received ? UInt64.max : old.receivedBytes + received,
+                sentBytes: old.sentBytes > UInt64.max - sent ? UInt64.max : old.sentBytes + sent
+            )
+        }
+        return result
+    }
+}
+
 struct TrafficSampleResult: Equatable {
     let receivedBytes: UInt64
     let sentBytes: UInt64
@@ -178,13 +284,36 @@ enum TrafficSampleCalculator {
         }
 
         // A packet can appear on both a VPN and its underlying Wi-Fi/Ethernet
-        // interface. Summing every connected service therefore double-counts
-        // traffic. The default-route device is the authoritative menu-bar rate.
-        let measuredDevice = services.first(where: { $0.connected && $0.isPrimary })?.device
-            ?? services.first(where: { $0.connected && $0.kind != .vpn })?.device
-            ?? services.first(where: \.connected)?.device
-        let measured = measuredDevice.flatMap { deltas[$0] }
-            ?? InterfaceCounters(receivedBytes: 0, sentBytes: 0)
+        // interface. Prefer the primary VPN when one is active; otherwise sum
+        // every connected physical transport so simultaneous Wi-Fi + cellular
+        // traffic is not silently omitted from the total rate.
+        var measured: InterfaceCounters
+        if let primaryVPN = services.first(where: {
+            $0.connected && $0.isPrimary && $0.kind == .vpn
+        })?.device.flatMap({ deltas[$0] }) {
+            measured = primaryVPN
+        } else {
+            let physicalDevices = services
+                .filter { $0.connected && $0.isPhysicalTransport }
+                .compactMap(\.device)
+            func saturatingAdd(_ lhs: UInt64, _ rhs: UInt64) -> UInt64 {
+                lhs > UInt64.max - rhs ? UInt64.max : lhs + rhs
+            }
+            measured = physicalDevices.reduce(
+                InterfaceCounters(receivedBytes: 0, sentBytes: 0)
+            ) { partial, device in
+                guard let delta = deltas[device] else { return partial }
+                return InterfaceCounters(
+                    receivedBytes: saturatingAdd(partial.receivedBytes, delta.receivedBytes),
+                    sentBytes: saturatingAdd(partial.sentBytes, delta.sentBytes)
+                )
+            }
+            if measured.receivedBytes == 0 && measured.sentBytes == 0,
+               let fallbackDevice = services.first(where: { $0.connected })?.device,
+               let fallback = deltas[fallbackDevice] {
+                measured = fallback
+            }
+        }
         return TrafficSampleResult(
             receivedBytes: measured.receivedBytes,
             sentBytes: measured.sentBytes,
@@ -573,6 +702,33 @@ final class NetworkManager {
         throw NetworkError.commandFailed("网络接口正在变化，请稍后重试。")
     }
 
+    func fetchProcessTrafficCounters() throws -> [String: ProcessTrafficCounters] {
+        ProcessTrafficParser.parse(try CommandRunner.run(
+            "/usr/bin/nettop",
+            ["-P", "-L", "1", "-x", "-n"],
+            timeout: 5
+        ))
+    }
+
+    func fetchPublicIPInfo() throws -> PublicIPInfo {
+        guard let info = PublicIPInfoParser.parse(try CommandRunner.run(
+            "/usr/bin/curl",
+            ["--fail", "--silent", "--show-error", "--location", "--max-time", "4", "https://ipinfo.io/json"],
+            timeout: 5
+        )) else {
+            throw NetworkError.commandFailed("出口 IP 暂时不可用。")
+        }
+        return info
+    }
+
+    /// Returns tunnel interfaces that have a routable address. macOS network
+    /// extensions (for example FlClash's TUN mode) may create an active utun
+    /// interface without registering a Network Service in `scutil --nc`.
+    func fetchActiveVPNInterfaceNames() -> Set<String> {
+        guard let output = try? CommandRunner.run("/sbin/ifconfig", []) else { return [] }
+        return parseActiveVPNInterfaceNames(output)
+    }
+
     func runDiagnostics() -> NetworkDiagnostic {
         let ipv4Route = try? CommandRunner.run("/sbin/route", ["-n", "get", "default"])
         let routeOutput = ipv4Route
@@ -855,6 +1011,45 @@ final class NetworkManager {
             result[fields[0]] = InterfaceCounters(receivedBytes: received, sentBytes: sent)
         }
         return result
+    }
+
+    func parseActiveVPNInterfaceNames(_ output: String) -> Set<String> {
+        var active: Set<String> = []
+        var currentInterface: String?
+        var hasRoutableAddress = false
+
+        func finishCurrentInterface() {
+            guard let currentInterface,
+                  hasRoutableAddress,
+                  currentInterface.hasPrefix("utun")
+                    || currentInterface.hasPrefix("ppp")
+                    || currentInterface.hasPrefix("tun") else { return }
+            active.insert(currentInterface)
+        }
+
+        for line in output.split(separator: "\n", omittingEmptySubsequences: false) {
+            let text = String(line)
+            if !text.hasPrefix(" ") && !text.hasPrefix("\t"),
+               let colon = text.firstIndex(of: ":") {
+                finishCurrentInterface()
+                currentInterface = String(text[..<colon])
+                hasRoutableAddress = false
+                continue
+            }
+            guard currentInterface != nil else { continue }
+            let trimmed = text.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("inet ") {
+                hasRoutableAddress = true
+            } else if trimmed.hasPrefix("inet6 ") {
+                let fields = trimmed.split(whereSeparator: \.isWhitespace)
+                if let address = fields.dropFirst().first,
+                   !address.hasPrefix("fe80:") {
+                    hasRoutableAddress = true
+                }
+            }
+        }
+        finishCurrentInterface()
+        return active
     }
 
     func parsePingLatency(_ output: String) -> Double? {

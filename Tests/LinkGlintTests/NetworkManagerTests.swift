@@ -2,6 +2,82 @@ import XCTest
 @testable import LinkGlint
 
 final class NetworkManagerTests: XCTestCase {
+    func testParsesProcessTrafficAndMergesPidSuffixes() {
+        let output = "time,,interface,state,bytes_in,bytes_out,rx_dupe,rx_ooo\n09:00,Chrome.123,,,100,200,0,0\n09:01,Chrome.456,,,30,40,0,0\n09:01,FlClashCore.9,,,500,600,0,0\n"
+        XCTAssertEqual(
+            ProcessTrafficParser.parse(output),
+            [
+                "Chrome": ProcessTrafficCounters(receivedBytes: 130, sentBytes: 240),
+                "FlClashCore": ProcessTrafficCounters(receivedBytes: 500, sentBytes: 600)
+            ]
+        )
+    }
+
+    func testParsesPublicIPAddressOnlyWhenOutputIsAnIPAddress() {
+        XCTAssertEqual(PublicIPAddressParser.parse("203.0.113.8\n"), "203.0.113.8")
+        XCTAssertEqual(PublicIPAddressParser.parse("2001:db8::8\n"), "2001:db8::8")
+        XCTAssertNil(PublicIPAddressParser.parse("192.168.1.10 interface"))
+        XCTAssertNil(PublicIPAddressParser.parse(""))
+    }
+
+    func testParsesPublicIPInfoFromJSON() {
+        let json = """
+        {"ip":"203.0.113.8","hostname":"example","city":"Tokyo","region":"Tokyo","country":"JP","loc":"35.0,139.0","org":"AS64500 Example","postal":"100-0001","timezone":"Asia/Tokyo"}
+        """
+        XCTAssertEqual(
+            PublicIPInfoParser.parse(json),
+            PublicIPInfo(address: "203.0.113.8", countryCode: "JP")
+        )
+        XCTAssertEqual(
+            PublicIPInfoParser.parse("{\"ip\":\"2001:db8::8\",\"country\":\"us\"}"),
+            PublicIPInfo(address: "2001:db8::8", countryCode: "US")
+        )
+    }
+
+    func testRejectsInvalidPublicIPInfoJSON() {
+        XCTAssertNil(PublicIPInfoParser.parse(""))
+        XCTAssertNil(PublicIPInfoParser.parse("203.0.113.8"))
+        XCTAssertNil(PublicIPInfoParser.parse("{\"country\":\"JP\"}"))
+        XCTAssertNil(PublicIPInfoParser.parse("{\"ip\":\"not-an-ip\",\"country\":\"JP\"}"))
+        XCTAssertEqual(
+            PublicIPInfoParser.parse("{\"ip\":\"203.0.113.8\",\"country\":\"Japan\"}"),
+            PublicIPInfo(address: "203.0.113.8", countryCode: nil)
+        )
+    }
+
+    func testFormatsPublicIPDisplayWithChineseCountry() {
+        XCTAssertEqual(
+            PublicIPDisplayFormatter.string(address: "203.0.113.8", countryCode: "JP"),
+            "203.0.113.8 · 🇯🇵 日本"
+        )
+        XCTAssertEqual(
+            PublicIPDisplayFormatter.string(address: "203.0.113.8", countryCode: nil),
+            "203.0.113.8"
+        )
+        XCTAssertEqual(
+            PublicIPDisplayFormatter.string(address: "203.0.113.8", countryCode: "ZZ"),
+            "203.0.113.8"
+        )
+    }
+
+    func testFormatsSensitiveRegionsWithChinaFlagOverrides() {
+        XCTAssertEqual(
+            PublicIPDisplayFormatter.string(address: "203.0.113.8", countryCode: "CN"),
+            "203.0.113.8 · 🇨🇳 中国"
+        )
+        let taiwan = PublicIPDisplayFormatter.string(address: "203.0.113.8", countryCode: "TW")
+        XCTAssertEqual(taiwan, "203.0.113.8 · 🇨🇳 中国台湾")
+        XCTAssertFalse(taiwan.contains("🇹🇼"))
+        XCTAssertEqual(
+            PublicIPDisplayFormatter.string(address: "203.0.113.8", countryCode: "HK"),
+            "203.0.113.8 · 🇨🇳 中国香港"
+        )
+        XCTAssertEqual(
+            PublicIPDisplayFormatter.string(address: "203.0.113.8", countryCode: "MO"),
+            "203.0.113.8 · 🇨🇳 中国澳门"
+        )
+    }
+
     func testWiFiSSIDCacheKeepsOnlyRecentValuesAfterReadFailure() {
         var cache = WiFiSSIDStabilityCache(fallbackLifetime: 30)
         XCTAssertEqual(
@@ -321,6 +397,17 @@ final class NetworkManagerTests: XCTestCase {
         XCTAssertEqual(NetworkManager().parseConnectedVPNServiceNames(output), ["Work VPN"])
     }
 
+    func testParsesRoutableTunnelInterfacesWithoutTreatingLinkLocalOnlyUtunAsVPN() {
+        let output = """
+        utun0: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380
+            inet6 fe80::1%utun0 prefixlen 64
+        utun4: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 9000
+            inet 198.18.0.1 --> 198.18.0.1 netmask 0xfffffffc
+        """
+
+        XCTAssertEqual(NetworkManager().parseActiveVPNInterfaceNames(output), ["utun4"])
+    }
+
     func testParsesVPNInterfaceAndMatchesPrimaryAmongMultipleConnections() {
         let manager = NetworkManager()
         let output = """
@@ -458,6 +545,26 @@ final class TrafficSampleCalculatorTests: XCTestCase {
         XCTAssertEqual(result.receivedBytes, 600)
         XCTAssertEqual(result.sentBytes, 200)
         XCTAssertEqual(result.deltasByDevice["utun4"], InterfaceCounters(receivedBytes: 500, sentBytes: 150))
+    }
+
+    func testSumsConnectedPhysicalTransportsWhenMoreThanOneCarriesTraffic() {
+        let result = TrafficSampleCalculator.calculate(
+            previous: [
+                "en0": .init(receivedBytes: 1_000, sentBytes: 2_000),
+                "en7": .init(receivedBytes: 4_000, sentBytes: 8_000)
+            ],
+            current: [
+                "en0": .init(receivedBytes: 1_600, sentBytes: 2_200),
+                "en7": .init(receivedBytes: 4_500, sentBytes: 8_150)
+            ],
+            services: [
+                service(name: "Wi-Fi", device: "en0", primary: true, kind: .wifi),
+                service(name: "Mobile", device: "en7", primary: false, kind: .cellular)
+            ]
+        )
+
+        XCTAssertEqual(result.receivedBytes, 1_100)
+        XCTAssertEqual(result.sentBytes, 350)
     }
 
     func testUsesPrimaryVPNTunnelCountersWhenInterfaceCanBeResolved() {

@@ -15,6 +15,23 @@ enum PrivilegedAccessState: Equatable {
     }
 }
 
+enum PrivilegedAccessGuidance: Equatable {
+    case none
+    case firstRun
+    case repair
+
+    static func make(state: PrivilegedAccessState, wasPreviouslyConfigured: Bool) -> Self {
+        switch state {
+        case .ready:
+            return .none
+        case .notConfigured:
+            return wasPreviouslyConfigured ? .repair : .firstRun
+        case .needsRepair:
+            return .repair
+        }
+    }
+}
+
 final class PrivilegedHelperManager {
     private static let helperProtocolVersion = 3
     static let installedHelperPath = "/Library/PrivilegedHelperTools/io.github.harenagodz.LinkGlintHelper"

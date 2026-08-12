@@ -16,6 +16,7 @@ private enum LinkGlintLayout {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopoverDelegate, CLLocationManagerDelegate, NSMenuItemValidation {
+    private static let privilegedOnboardingCompletedKey = "privilegedAccessOnboardingCompleted.v1"
     private let menuBarRenderer = MenuBarRenderer()
 
     private let manager = NetworkManager()
@@ -42,6 +43,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
     private var isKeepingStatusPanelOpenForModalInteraction = false
     private var statusContextMenu: NSMenu?
     private var statusPanelIsOpen = false
+    private var statusPanelIsPinned = false
     private var statusPanelPreviousApplication: NSRunningApplication?
     private var statusPanelLocalEventMonitor: Any?
     private var statusPanelGlobalEventMonitor: Any?
@@ -52,8 +54,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
     private weak var statusPanelTrafficRatesLabel: NSTextField?
     private weak var statusPanelTrafficRangeLabel: NSTextField?
     private weak var statusPanelTrafficChart: TrafficChartView?
+    private weak var statusPanelProcessTrafficView: NSStackView?
+    private weak var statusPanelIPLabel: NSTextField?
+    private var currentPublicIPAddress: String?
+    private var currentPublicIPCountryCode: String?
+    private var lastEgressIPFetchUptime: TimeInterval?
+    private var isFetchingEgressIP = false
+    private static let egressIPRefreshInterval: TimeInterval = 60
+    private weak var statusPanelPinButton: NSButton?
     private weak var statusPanelDiagnosticButton: NSButton?
     private weak var statusContextUsageItem: NSMenuItem?
+    private weak var statusContextTrafficItem: NSMenuItem?
     private weak var statusContextLoginItem: NSMenuItem?
     private var mainWindow: NSWindow!
     private var preferencesWindow: NSWindow?
@@ -104,12 +115,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
     private var isDiagnosing = false
     private var diagnosticPending = false
     private var privilegedAccessState: PrivilegedAccessState = .notConfigured
+    private var automaticallyPresentedAccessGuidance: PrivilegedAccessGuidance?
     private var lastServices: [NetworkService] = []
     private var renderedWindowServices: [NetworkService]?
     private var lastDiagnostic: NetworkDiagnostic?
     private var previousTrafficCounters: [String: InterfaceCounters] = [:]
     private var previousTrafficSampleDate: Date?
     private var previousTrafficSampleUptime: TimeInterval?
+    private var previousProcessTrafficCounters: [String: ProcessTrafficCounters] = [:]
+    private var previousProcessTrafficUptime: TimeInterval?
+    private var currentProcessTraffic: [(name: String, download: Double, upload: Double)] = []
+    private var smoothedProcessTraffic: [String: (download: Double, upload: Double)] = [:]
+    private var processTrafficIdleSamples: [String: Int] = [:]
+    private var activeVPNInterfaceNames: Set<String> = []
     private var currentDownloadBytesPerSecond: Double = 0
     private var currentUploadBytesPerSecond: Double = 0
     private var trafficRateHistory = TrafficRateHistory(capacity: 60)
@@ -234,6 +252,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         previousTrafficCounters.removeAll()
         previousTrafficSampleDate = nil
         previousTrafficSampleUptime = nil
+        previousProcessTrafficCounters.removeAll()
+        previousProcessTrafficUptime = nil
+        currentProcessTraffic.removeAll()
+        smoothedProcessTraffic.removeAll()
+        processTrafficIdleSamples.removeAll()
+        updateStatusPanelProcessTraffic()
         currentDownloadBytesPerSecond = 0
         currentUploadBytesPerSecond = 0
         if let label = statusPanelTrafficRatesLabel {
@@ -408,9 +432,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
                     if self.previousTrafficSampleDate == nil || servicesChanged {
                         self.sampleTraffic()
                     }
+                    if servicesChanged {
+                        self.refreshEgressIPIfNeeded(force: true)
+                    }
                     if self.diagnosticPending && !self.isDiagnosing {
                         self.runDiagnostics()
                     }
+                    self.schedulePrivilegedAccessGuidance(for: accessState)
                     self.completeNetworkRefresh()
                 }
             } catch {
@@ -702,6 +730,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         usageItem.isEnabled = false
         statusContextUsageItem = usageItem
         let activityMenu = NSMenu()
+        let trafficItem = NSMenuItem(title: "当前速率：↓ 0 B/s · ↑ 0 B/s", action: nil, keyEquivalent: "")
+        trafficItem.identifier = NSUserInterfaceItemIdentifier("current-traffic")
+        trafficItem.isEnabled = false
+        statusContextTrafficItem = trafficItem
+        activityMenu.addItem(trafficItem)
         activityMenu.addItem(usageItem)
 
         let usageHistory = NSMenuItem(title: "查看用量历史…", action: #selector(showUsageHistory), keyEquivalent: "")
@@ -867,7 +900,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         NSApp.activate(ignoringOtherApps: true)
         statusPopover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         statusPopover.contentViewController?.view.window?.makeKey()
+        if statusPanelIsPinned {
+            statusPopover.contentViewController?.view.window?.level = .floating
+            statusPopover.contentViewController?.view.window?.collectionBehavior.insert(.canJoinAllSpaces)
+        }
         updateUsageDisplay()
+        refreshEgressIPIfNeeded()
         installStatusPanelDismissalMonitors()
     }
 
@@ -961,7 +999,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
                 || self.eventIsInsideStatusButton(event) {
                 return event
             }
-            self.closeStatusPanel()
+            if StatusPanelDismissalPolicy.dismissesForExternalInteraction(isPinned: self.statusPanelIsPinned) {
+                self.closeStatusPanel()
+            }
             return event
         }
         statusPanelGlobalEventMonitor = NSEvent.addGlobalMonitorForEvents(
@@ -969,7 +1009,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         ) { [weak self] _ in
             DispatchQueue.main.async {
                 guard self?.isRequestingLocationAuthorization != true,
-                      self?.isKeepingStatusPanelOpenForModalInteraction != true else { return }
+                      self?.isKeepingStatusPanelOpenForModalInteraction != true,
+                      self?.statusPanelIsPinned != true else { return }
                 self?.closeStatusPanel()
             }
         }
@@ -979,9 +1020,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
             queue: .main
         ) { [weak self] _ in
             guard self?.isRequestingLocationAuthorization != true,
-                  self?.isKeepingStatusPanelOpenForModalInteraction != true else { return }
+                  self?.isKeepingStatusPanelOpenForModalInteraction != true,
+                  self?.statusPanelIsPinned != true else { return }
             self?.closeStatusPanel()
         }
+    }
+
+    @objc private func toggleStatusPanelPinned() {
+        statusPanelIsPinned.toggle()
+        updateStatusPanelPinButton()
+        if statusPanelIsPinned {
+            statusPopover.contentViewController?.view.window?.level = .floating
+            statusPopover.contentViewController?.view.window?.collectionBehavior.insert(.canJoinAllSpaces)
+        } else {
+            statusPopover.contentViewController?.view.window?.level = .normal
+        }
+    }
+
+    private func updateStatusPanelPinButton() {
+        guard let button = statusPanelPinButton else { return }
+        button.image = NSImage(
+            systemSymbolName: statusPanelIsPinned ? "pin.fill" : "pin",
+            accessibilityDescription: nil
+        )
+        button.contentTintColor = statusPanelIsPinned ? .controlAccentColor : .labelColor
+        button.toolTip = statusPanelIsPinned ? "取消置顶；恢复点击外部自动关闭" : "置顶面板；切换应用时继续观察进程流量"
+        button.setAccessibilityLabel(statusPanelIsPinned ? "取消置顶面板" : "置顶面板")
+        button.state = statusPanelIsPinned ? .on : .off
     }
 
     private func eventIsInsideStatusButton(_ event: NSEvent) -> Bool {
@@ -1011,7 +1076,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         let rowViewportHeight = CGFloat(visibleRows) * LinkGlintLayout.panelRowHeight
             + CGFloat(max(visibleRows - 1, 0)) * LinkGlintLayout.compactGap
         let permissionHeight: CGFloat = privilegedAccessState == .ready ? 0 : 30
-        let height: CGFloat = 214 + permissionHeight + rowViewportHeight
+        let height: CGFloat = 348 + permissionHeight + rowViewportHeight
         let controller = NSViewController()
         // NSPopover already supplies the window shape and shadow. A second
         // vibrancy layer here used to blend strongly with colorful wallpapers,
@@ -1022,6 +1087,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
 
         let refreshButton = compactIconButton(symbol: "arrow.clockwise", label: "刷新", action: #selector(refresh))
         refreshButton.translatesAutoresizingMaskIntoConstraints = false
+        let pinButton = compactIconButton(symbol: "pin", label: "置顶面板", action: #selector(toggleStatusPanelPinned))
+        pinButton.translatesAutoresizingMaskIntoConstraints = false
+        statusPanelPinButton = pinButton
+        updateStatusPanelPinButton()
 
         let brandTitle = NSTextField(labelWithString: "LinkGlint")
         brandTitle.font = .systemFont(ofSize: 13.5, weight: .bold)
@@ -1035,9 +1104,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         brandHeader.addSubview(brandTitle)
         brandHeader.addSubview(brandDivider)
         brandHeader.addSubview(refreshButton)
+        brandHeader.addSubview(pinButton)
         NSLayoutConstraint.activate([
             brandTitle.centerXAnchor.constraint(equalTo: brandHeader.centerXAnchor),
             brandTitle.topAnchor.constraint(equalTo: brandHeader.topAnchor),
+            pinButton.centerYAnchor.constraint(equalTo: brandTitle.centerYAnchor),
+            pinButton.trailingAnchor.constraint(equalTo: refreshButton.leadingAnchor, constant: -4),
             refreshButton.centerYAnchor.constraint(equalTo: brandTitle.centerYAnchor),
             refreshButton.trailingAnchor.constraint(equalTo: brandHeader.trailingAnchor),
             brandDivider.leadingAnchor.constraint(equalTo: brandHeader.leadingAnchor),
@@ -1110,8 +1182,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         ])
 
         let trafficChart = statusPanelTrafficChartCard()
+        let ipStatus = statusPanelIPStatusCard()
+        let processTraffic = statusPanelProcessTrafficCard()
         let footer = statusPanelFooter(services: services)
-        let stack = NSStackView(views: [brandHeader, sectionHeader, scroll, trafficChart, footer])
+        let stack = NSStackView(views: [brandHeader, sectionHeader, scroll, trafficChart, ipStatus, processTraffic, footer])
         stack.orientation = .vertical
         stack.alignment = .width
         stack.spacing = 6
@@ -1188,6 +1262,166 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         return card
     }
 
+    private func statusPanelProcessTrafficCard() -> NSView {
+        let title = NSTextField(labelWithString: "进程实时流量")
+        title.font = .systemFont(ofSize: 10.5, weight: .semibold)
+        title.textColor = .secondaryLabelColor
+        title.setContentCompressionResistancePriority(.required, for: .horizontal)
+        title.setContentCompressionResistancePriority(.required, for: .vertical)
+        let hint = NSTextField(labelWithString: "TOP 5 · 总速率排序")
+        hint.font = .systemFont(ofSize: 9)
+        hint.textColor = .tertiaryLabelColor
+        hint.lineBreakMode = .byTruncatingTail
+        hint.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        spacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let header = NSStackView(views: [title, spacer, hint])
+        header.orientation = .horizontal; header.alignment = .centerY
+        header.setContentCompressionResistancePriority(.required, for: .vertical)
+        let processHeading = NSTextField(labelWithString: "应用 / 进程")
+        let downloadHeading = NSTextField(labelWithString: "↓ 下载")
+        let uploadHeading = NSTextField(labelWithString: "↑ 上传")
+        for label in [processHeading, downloadHeading, uploadHeading] {
+            label.font = .systemFont(ofSize: 8.5, weight: .medium)
+            label.textColor = .tertiaryLabelColor
+        }
+        downloadHeading.alignment = .right; uploadHeading.alignment = .right
+        downloadHeading.translatesAutoresizingMaskIntoConstraints = false
+        uploadHeading.translatesAutoresizingMaskIntoConstraints = false
+        downloadHeading.widthAnchor.constraint(equalToConstant: 72).isActive = true
+        uploadHeading.widthAnchor.constraint(equalToConstant: 72).isActive = true
+        let headingSpacer = NSView(); headingSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let headings = NSStackView(views: [processHeading, headingSpacer, downloadHeading, uploadHeading])
+        headings.orientation = .horizontal; headings.spacing = 5; headings.alignment = .centerY
+        headings.setContentCompressionResistancePriority(.required, for: .vertical)
+        let rows = NSStackView(); rows.orientation = .vertical; rows.spacing = 1
+        for index in 0..<5 {
+            let row = ProcessTrafficRowView(rank: index + 1)
+            row.identifier = NSUserInterfaceItemIdentifier("process-traffic-row-\(index)")
+            rows.addArrangedSubview(row)
+        }
+        let content = NSStackView(views: [header, headings, rows])
+        content.orientation = .vertical; content.spacing = 3
+        content.alignment = .width
+        content.edgeInsets = NSEdgeInsets(top: 9, left: 8, bottom: 7, right: 8)
+        content.translatesAutoresizingMaskIntoConstraints = false
+        let card = NSBox(); card.boxType = .custom; card.cornerRadius = LinkGlintLayout.rowRadius
+        card.borderWidth = 1; card.borderColor = NSColor.separatorColor.withAlphaComponent(0.28)
+        card.fillColor = NSColor.controlBackgroundColor.withAlphaComponent(0.20)
+        card.contentView?.addSubview(content)
+        NSLayoutConstraint.activate([
+            content.topAnchor.constraint(equalTo: card.contentView!.topAnchor),
+            content.leadingAnchor.constraint(equalTo: card.contentView!.leadingAnchor),
+            content.trailingAnchor.constraint(equalTo: card.contentView!.trailingAnchor),
+            content.bottomAnchor.constraint(equalTo: card.contentView!.bottomAnchor)
+        ])
+        statusPanelProcessTrafficView = rows
+        updateStatusPanelProcessTraffic()
+        return card
+    }
+
+    private func statusPanelIPStatusCard() -> NSView {
+        let title = NSTextField(labelWithString: "出口 IP")
+        title.font = .systemFont(ofSize: 10.5, weight: .semibold)
+        title.textColor = .secondaryLabelColor
+        let label = NSTextField(labelWithString: "检测中…")
+        label.font = .systemFont(ofSize: 11, weight: .medium)
+        label.alignment = .right
+        label.textColor = .labelColor
+        label.lineBreakMode = .byTruncatingMiddle
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        statusPanelIPLabel = label
+        let row = NSStackView(views: [title, NSView(), label])
+        row.orientation = .horizontal; row.alignment = .centerY; row.spacing = 6
+        row.translatesAutoresizingMaskIntoConstraints = false
+        let card = NSBox(); card.boxType = .custom; card.cornerRadius = LinkGlintLayout.rowRadius
+        card.borderWidth = 1; card.borderColor = NSColor.separatorColor.withAlphaComponent(0.22)
+        card.fillColor = NSColor.controlBackgroundColor.withAlphaComponent(0.16)
+        card.contentView?.addSubview(row)
+        NSLayoutConstraint.activate([
+            card.heightAnchor.constraint(equalToConstant: 32),
+            row.leadingAnchor.constraint(equalTo: card.contentView!.leadingAnchor, constant: 8),
+            row.trailingAnchor.constraint(equalTo: card.contentView!.trailingAnchor, constant: -8),
+            row.topAnchor.constraint(equalTo: card.contentView!.topAnchor),
+            row.bottomAnchor.constraint(equalTo: card.contentView!.bottomAnchor)
+        ])
+        updateStatusPanelIP()
+        return card
+    }
+
+    private func updateStatusPanelIP() {
+        guard let label = statusPanelIPLabel else { return }
+        if let address = currentPublicIPAddress {
+            let text = PublicIPDisplayFormatter.string(
+                address: address,
+                countryCode: currentPublicIPCountryCode
+            )
+            label.stringValue = text
+            label.toolTip = "最近检测：\(text)"
+        } else {
+            label.stringValue = "检测中…"
+            label.toolTip = "正在检测出口 IP"
+        }
+    }
+
+    private func refreshEgressIPIfNeeded(force: Bool = false) {
+        let uptime = ProcessInfo.processInfo.systemUptime
+        if !force,
+           let last = lastEgressIPFetchUptime,
+           uptime >= last,
+           uptime - last < Self.egressIPRefreshInterval {
+            return
+        }
+        guard !isFetchingEgressIP else { return }
+        isFetchingEgressIP = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            let info = try? self.manager.fetchPublicIPInfo()
+            DispatchQueue.main.async {
+                self.isFetchingEgressIP = false
+                self.lastEgressIPFetchUptime = ProcessInfo.processInfo.systemUptime
+                if let info {
+                    self.currentPublicIPAddress = info.address
+                    self.currentPublicIPCountryCode = info.countryCode
+                }
+                self.updateStatusPanelIP()
+            }
+        }
+    }
+
+    private func updateStatusPanelProcessTraffic() {
+        guard let rows = statusPanelProcessTrafficView else { return }
+        let values = currentProcessTraffic
+        for (index, view) in rows.arrangedSubviews.enumerated() {
+            guard let row = view as? ProcessTrafficRowView else { continue }
+            if index < values.count {
+                let value = values[index]
+                row.configure(
+                    name: value.name,
+                    icon: processIcon(named: value.name),
+                    download: fixedWidthRate(value.download),
+                    upload: fixedWidthRate(value.upload)
+                )
+            } else if index == 0 {
+                row.showPlaceholder()
+            } else {
+                row.clearSlot()
+            }
+        }
+    }
+
+    private func processIcon(named name: String) -> NSImage? {
+        let normalized = name.lowercased()
+        if let app = NSWorkspace.shared.runningApplications.first(where: {
+            $0.localizedName?.lowercased() == normalized
+                || $0.executableURL?.deletingPathExtension().lastPathComponent.lowercased() == normalized
+        }), let url = app.bundleURL ?? app.executableURL {
+            return NSWorkspace.shared.icon(forFile: url.path)
+        }
+        return NSImage(systemSymbolName: "terminal", accessibilityDescription: nil)
+    }
+
     private var statusPanelTrafficRateText: NSAttributedString {
         MenuBarRenderer.trafficRateAttributedString(
             downloadBytesPerSecond: currentDownloadBytesPerSecond,
@@ -1207,6 +1441,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
     private func statusPanelServiceRow(_ service: NetworkService, allServices: [NetworkService]) -> NSView {
         let icon = NSImageView()
         icon.image = symbol(for: service)
+        icon.setAccessibilityElement(false)
+        icon.setAccessibilityHidden(true)
         icon.symbolConfiguration = .init(pointSize: 15, weight: .medium)
         icon.contentTintColor = service.connected ? statusColor(for: service.kind) : .secondaryLabelColor
         icon.translatesAutoresizingMaskIntoConstraints = false
@@ -1258,7 +1494,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         enabledSwitch.controlSize = .small
         enabledSwitch.payload = ["name": service.name]
         enabledSwitch.toolTip = service.enabled ? "停用 \(serviceDisplayName)" : "启用 \(serviceDisplayName)"
-        enabledSwitch.setAccessibilityLabel("启用 \(serviceDisplayName)")
+        enabledSwitch.setAccessibilityLabel("\(serviceDisplayName) 网络服务")
+        enabledSwitch.setAccessibilityHelp(service.enabled ? "停用 \(serviceDisplayName)" : "启用 \(serviceDisplayName)")
         views.append(enabledSwitch)
         views.append(serviceActionsButton(service, allServices: allServices))
         let row = NSStackView(views: views)
@@ -1482,6 +1719,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
             let counters = try? self.manager.fetchTrafficCounters()
+            let processCounters = try? self.manager.fetchProcessTrafficCounters()
+            let activeVPNInterfaces = self.manager.fetchActiveVPNInterfaceNames()
             let sampleDate = Date()
             let sampleUptime = ProcessInfo.processInfo.systemUptime
             DispatchQueue.main.async {
@@ -1491,6 +1730,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
                     return
                 }
                 guard let counters else { return }
+                self.activeVPNInterfaceNames = activeVPNInterfaces
+                self.refreshEgressIPIfNeeded()
                 if let previousUptime = self.previousTrafficSampleUptime {
                     // A monotonic clock is immune to manual time changes and
                     // time-zone adjustments that otherwise create rate spikes.
@@ -1532,6 +1773,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
                     }
                     self.updateUsageDisplay()
                     self.applyMenuBarAppearance()
+                }
+                if let processCounters {
+                    if let previousProcessUptime = self.previousProcessTrafficUptime {
+                        let interval = max(sampleUptime - previousProcessUptime, 0.1)
+                        var sampledNames = Set<String>()
+                        for (name, current) in processCounters {
+                            guard let old = self.previousProcessTrafficCounters[name] else { continue }
+                            let received = current.receivedBytes >= old.receivedBytes
+                                ? current.receivedBytes - old.receivedBytes : 0
+                            let sent = current.sentBytes >= old.sentBytes
+                                ? current.sentBytes - old.sentBytes : 0
+                            sampledNames.insert(name)
+                            let download = Double(received) / interval
+                            let upload = Double(sent) / interval
+                            let oldRate = self.smoothedProcessTraffic[name] ?? (download: 0, upload: 0)
+                            self.smoothedProcessTraffic[name] = (
+                                download: oldRate.download * 0.55 + download * 0.45,
+                                upload: oldRate.upload * 0.55 + upload * 0.45
+                            )
+                            if download >= 1 || upload >= 1 {
+                                self.processTrafficIdleSamples[name] = 0
+                            } else {
+                                self.processTrafficIdleSamples[name, default: 0] += 1
+                            }
+                        }
+                        for name in self.smoothedProcessTraffic.keys where !sampledNames.contains(name) {
+                            self.processTrafficIdleSamples[name, default: 0] += 1
+                        }
+                        let expired = self.processTrafficIdleSamples.filter { $0.value >= 4 }.map(\.key)
+                        for name in expired {
+                            self.smoothedProcessTraffic.removeValue(forKey: name)
+                            self.processTrafficIdleSamples.removeValue(forKey: name)
+                        }
+                        var processRates = self.smoothedProcessTraffic.map {
+                            (name: $0.key, download: $0.value.download, upload: $0.value.upload)
+                        }
+                        processRates.removeAll { ($0.download + $0.upload) < 1 }
+                        processRates.sort { ($0.download + $0.upload) > ($1.download + $1.upload) }
+                        self.currentProcessTraffic = Array(processRates.prefix(5))
+                        if self.statusPanelIsOpen { self.updateStatusPanelProcessTraffic() }
+                    }
+                    self.previousProcessTrafficCounters = processCounters
+                    self.previousProcessTrafficUptime = sampleUptime
                 }
                 self.previousTrafficCounters = counters
                 self.previousTrafficSampleDate = sampleDate
@@ -1575,6 +1859,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         let context = MenuBarRenderContext(
             symbolName: networkPresentation.symbolName,
             networkTitle: networkPresentation.title,
+            vpnConnected: networkPresentation.vpnConnected,
             downloadBytesPerSecond: currentDownloadBytesPerSecond,
             uploadBytesPerSecond: currentUploadBytesPerSecond,
             showsNetworkTitle: preferences.showMenuBarTitle,
@@ -1626,7 +1911,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         if initialRefreshError != nil, lastServices.isEmpty {
             return .init(title: "读取失败", symbolName: "exclamationmark.triangle")
         }
-        return NetworkStatusPresentation.make(services: lastServices, hasLoaded: hasLoadedNetworkState)
+        return NetworkStatusPresentation.make(
+            services: lastServices,
+            hasLoaded: hasLoadedNetworkState,
+            activeVPNInterfaceNames: activeVPNInterfaceNames
+        )
     }
 
     private func symbol(for service: NetworkService) -> NSImage? {
@@ -1640,7 +1929,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         }
         let image = NSImage(
             systemSymbolName: name,
-            accessibilityDescription: NetworkDisplayText.singleLine(service.name)
+            accessibilityDescription: nil
         )
         image?.isTemplate = true
         return image
@@ -2291,12 +2580,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
     }
 
     @objc private func showPrivilegedAccessSetup() {
-        configurePrivilegedAccess(afterConfiguration: nil)
+        configurePrivilegedAccess(afterConfiguration: nil, guidance: nil)
+    }
+
+    private func schedulePrivilegedAccessGuidance(for state: PrivilegedAccessState) {
+        let defaults = UserDefaults.standard
+        if state == .ready {
+            defaults.set(true, forKey: Self.privilegedOnboardingCompletedKey)
+            automaticallyPresentedAccessGuidance = nil
+            return
+        }
+        let guidance = PrivilegedAccessGuidance.make(
+            state: state,
+            wasPreviouslyConfigured: defaults.bool(forKey: Self.privilegedOnboardingCompletedKey)
+        )
+        guard guidance != .none,
+              automaticallyPresentedAccessGuidance != guidance else { return }
+        automaticallyPresentedAccessGuidance = guidance
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            guard let self,
+                  self.privilegedAccessState == state,
+                  !self.isConfiguringPrivilegedAccess else { return }
+            self.showMainWindow()
+            self.configurePrivilegedAccess(afterConfiguration: nil, guidance: guidance)
+        }
     }
 
     private func configurePrivilegedAccess(
         afterConfiguration: (() -> Void)?,
-        onUnavailable: (() -> Void)? = nil
+        onUnavailable: (() -> Void)? = nil,
+        guidance: PrivilegedAccessGuidance? = nil
     ) {
         guard !isConfiguringPrivilegedAccess,
               !isPerformingPrivilegedChange,
@@ -2328,9 +2641,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
 
         let alert = NSAlert()
         alert.alertStyle = .informational
-        alert.messageText = currentState == .needsRepair ? "修复免密码网络权限" : "首次配置免密码网络切换"
-        alert.informativeText = "下一步会显示一次 macOS 管理员授权。LinkGlint 将安装只允许网络设置操作的本机助手；完成后，日常网络修改不再输入密码。登录时启动无需此权限。"
-        alert.addButton(withTitle: currentState == .needsRepair ? "修复权限" : "开始配置")
+        let resolvedGuidance = guidance ?? PrivilegedAccessGuidance.make(
+            state: currentState,
+            wasPreviouslyConfigured: UserDefaults.standard.bool(forKey: Self.privilegedOnboardingCompletedKey)
+        )
+        switch resolvedGuidance {
+        case .firstRun:
+            alert.messageText = "欢迎使用 LinkGlint · 步骤 1/2"
+            alert.informativeText = "要启用网络切换、DNS 和服务优先级管理，需要完成一次管理员授权。下一步将安装只接受固定网络命令的本机助手；日常使用不会再询问密码。"
+            alert.addButton(withTitle: "继续配置")
+        case .repair:
+            alert.alertStyle = .warning
+            alert.messageText = "检测到网络权限已失效 · 步骤 1/2"
+            alert.informativeText = "LinkGlint 的受限权限助手缺失、版本不一致或验证失败。下一步会请求一次 macOS 管理员授权来重新安装并验证；不会更改当前网络连接。"
+            alert.addButton(withTitle: "开始修复")
+        case .none:
+            alert.messageText = "配置网络管理权限 · 步骤 1/2"
+            alert.informativeText = "下一步会显示一次 macOS 管理员授权。LinkGlint 将安装只允许网络设置操作的本机助手；完成后，日常网络修改不再输入密码。"
+            alert.addButton(withTitle: "开始配置")
+        }
         alert.addButton(withTitle: "稍后")
         NSApp.activate(ignoringOtherApps: true)
         isKeepingStatusPanelOpenForModalInteraction = true
@@ -2364,13 +2693,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
                 switch result {
                 case .success(let state):
                     self.privilegedAccessState = state
+                    if state == .ready {
+                        UserDefaults.standard.set(true, forKey: Self.privilegedOnboardingCompletedKey)
+                    }
                     self.updatePrivilegedAccessControls()
                     if !self.lastServices.isEmpty { self.rebuildMenu(with: self.lastServices) }
 
                     let success = NSAlert()
                     success.alertStyle = .informational
-                    success.messageText = "配置完成"
-                    success.informativeText = "之后启用、停用或切换网络将直接执行，不再显示密码窗口。登录时启动由 macOS 原生登录项单独管理。"
+                    success.messageText = "步骤 2/2 · 配置完成"
+                    success.informativeText = "网络管理权限已验证。之后启用、停用或切换网络，以及修改 DNS 和优先级，都将直接执行且不再显示密码窗口。"
                     success.addButton(withTitle: "完成")
                     success.runModal()
                     afterConfiguration?()
@@ -2428,6 +2760,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
                 switch result {
                 case .success(let state):
                     self.privilegedAccessState = state
+                    UserDefaults.standard.set(false, forKey: Self.privilegedOnboardingCompletedKey)
+                    self.automaticallyPresentedAccessGuidance = nil
                     self.updatePrivilegedAccessControls()
                     if !self.lastServices.isEmpty { self.rebuildMenu(with: self.lastServices) }
                 case .failure(let error):
@@ -2810,6 +3144,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         if statusContextUsageItem?.title != menuText {
             statusContextUsageItem?.title = menuText
         }
+        let trafficText = "当前速率：↓ \(TrafficRateFormatter.string(bytesPerSecond: currentDownloadBytesPerSecond, usesBits: preferences.menuBarSpeedInBits)) · ↑ \(TrafficRateFormatter.string(bytesPerSecond: currentUploadBytesPerSecond, usesBits: preferences.menuBarSpeedInBits))"
+        if statusContextTrafficItem?.title != trafficText {
+            statusContextTrafficItem?.title = trafficText
+        }
     }
 
     @objc private func resetTodayUsage() {
@@ -2943,7 +3281,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
 
         let stack = NSStackView(views: [segmentRow, scroll, footer])
         stack.orientation = .vertical
-        stack.alignment = .width
+        stack.alignment = .leading
         stack.spacing = 12
         stack.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(stack)
@@ -2953,6 +3291,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
             stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -18),
             stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -14)
         ])
+        for view in [segmentRow, scroll, footer] {
+            NSLayoutConstraint.activate([
+                view.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
+                view.trailingAnchor.constraint(equalTo: stack.trailingAnchor)
+            ])
+        }
         stack.setCustomSpacing(14, after: segmentRow)
 
         showPreferencesPage(at: 0)
@@ -3024,6 +3368,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
             action: #selector(menuBarPresetSegmentChanged(_:))
         )
         presetSegment.segmentStyle = .rounded
+        presetSegment.setAccessibilityLabel("菜单栏显示预设")
         presetSegment.translatesAutoresizingMaskIntoConstraints = false
         menuBarPresetSegment = presetSegment
         syncMenuBarPresetSegment()
@@ -3070,6 +3415,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         indicatorPopup.target = self
         indicatorPopup.action = #selector(trafficIndicatorStyleChanged(_:))
         indicatorPopup.controlSize = .small
+        indicatorPopup.setAccessibilityLabel("上下行标记")
         menuBarIndicatorPopup = indicatorPopup
         let indicatorSpacer = NSView()
         indicatorSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -3089,6 +3435,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         intervalPopup.target = self
         intervalPopup.action = #selector(trafficIntervalChanged(_:))
         intervalPopup.controlSize = .small
+        intervalPopup.setAccessibilityLabel("刷新间隔")
         menuBarIntervalPopup = intervalPopup
         let intervalSpacer = NSView()
         intervalSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -3206,7 +3553,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
     private func preferenceTabContent(views: [NSView]) -> NSView {
         let stack = NSStackView(views: views)
         stack.orientation = .vertical
-        stack.alignment = .width
+        stack.alignment = .leading
         stack.spacing = 12
         stack.translatesAutoresizingMaskIntoConstraints = false
         for view in views {
@@ -3222,6 +3569,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
             stack.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             stack.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -8)
         ])
+        // NSStackView's `.width` alignment does not mean "stretch arranged
+        // subviews". Pinning each section explicitly prevents intrinsic-width
+        // cards from drifting to the trailing edge of the preferences window.
+        for view in views {
+            NSLayoutConstraint.activate([
+                view.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
+                view.trailingAnchor.constraint(equalTo: stack.trailingAnchor)
+            ])
+        }
         return container
     }
 
@@ -3276,8 +3632,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         }
         let stack = NSStackView(views: arranged)
         stack.orientation = .vertical
-        // Stretch children to the card width; text stays left via field.alignment.
-        stack.alignment = .width
+        stack.alignment = .leading
         stack.spacing = 10
         stack.translatesAutoresizingMaskIntoConstraints = false
         let panel = NSBox()
@@ -3295,6 +3650,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
             stack.leadingAnchor.constraint(equalTo: panel.contentView!.leadingAnchor, constant: 14),
             stack.trailingAnchor.constraint(equalTo: panel.contentView!.trailingAnchor, constant: -14)
         ])
+        for view in arranged {
+            NSLayoutConstraint.activate([
+                view.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
+                view.trailingAnchor.constraint(equalTo: stack.trailingAnchor)
+            ])
+        }
         return panel
     }
 
@@ -3609,7 +3970,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
 
         // Compact header: current connection first, advanced actions behind icons.
         let headerIcon = NSImageView()
-        headerIcon.image = NSImage(systemSymbolName: "network", accessibilityDescription: "LinkGlint")
+        headerIcon.image = NSImage(systemSymbolName: "network", accessibilityDescription: nil)
+        // The adjacent title already conveys the brand. Exposing this decorative
+        // symbol creates a duplicate "LinkGlint" stop for VoiceOver.
+        headerIcon.setAccessibilityElement(false)
+        headerIcon.setAccessibilityHidden(true)
         headerIcon.symbolConfiguration = .init(pointSize: 21, weight: .semibold)
         headerIcon.contentTintColor = .systemBlue
         headerIcon.translatesAutoresizingMaskIntoConstraints = false
@@ -3662,7 +4027,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         accessBanner.borderWidth = 1
 
         let shield = NSImageView()
-        shield.image = NSImage(systemSymbolName: "checkmark.shield", accessibilityDescription: "权限状态")
+        shield.image = NSImage(systemSymbolName: "checkmark.shield", accessibilityDescription: nil)
+        shield.setAccessibilityElement(false)
+        shield.setAccessibilityHidden(true)
         shield.symbolConfiguration = .init(pointSize: 17, weight: .medium)
         shield.contentTintColor = .systemBlue
         shield.translatesAutoresizingMaskIntoConstraints = false
@@ -3697,11 +4064,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         profileTitle.textColor = .secondaryLabelColor
         profilePopup = NSPopUpButton(frame: .zero, pullsDown: false)
         profilePopup.identifier = NSUserInterfaceItemIdentifier("network-operation-control")
+        profilePopup.setAccessibilityLabel("网络方案")
+        profilePopup.setAccessibilityHelp("选择要应用的网络配置方案")
         profilePopup.controlSize = .small
         profilePopup.cell?.lineBreakMode = .byTruncatingTail
         profilePopup.translatesAutoresizingMaskIntoConstraints = false
         let applyProfileButton = NSButton(title: "应用", target: self, action: #selector(applySelectedProfile))
         applyProfileButton.identifier = NSUserInterfaceItemIdentifier("network-operation-control")
+        applyProfileButton.setAccessibilityLabel("应用所选网络方案")
         applyProfileButton.bezelStyle = .rounded
         applyProfileButton.controlSize = .small
         applyProfileButton.contentTintColor = .systemBlue
@@ -3928,6 +4298,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
 
         let iconView = NSImageView()
         iconView.image = symbol(for: service)
+        // Service name and state are represented by the neighboring labels.
+        // Keeping the icon out of the accessibility tree avoids reading every
+        // adapter name twice.
+        iconView.setAccessibilityElement(false)
+        iconView.setAccessibilityHidden(true)
         iconView.contentTintColor = service.connected ? accentColor : .secondaryLabelColor
         iconView.symbolConfiguration = .init(pointSize: 17, weight: .medium)
         iconView.translatesAutoresizingMaskIntoConstraints = false
@@ -3978,7 +4353,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         toggle.payload = ["name": service.name]
         toggle.controlSize = .small
         toggle.toolTip = service.enabled ? "停用 \(displayName)" : "启用 \(displayName)"
-        toggle.setAccessibilityLabel("启用 \(displayName)")
+        toggle.setAccessibilityLabel("\(displayName) 网络服务")
+        toggle.setAccessibilityHelp(service.enabled ? "停用 \(displayName)" : "启用 \(displayName)")
 
         let more = serviceActionsButton(service, allServices: allServices)
         var rowViews: [NSView] = [iconView, labels, spacer]
@@ -4157,6 +4533,87 @@ private final class AlertAccessoryView: NSView {
 
 private final class NetworkActionButton: NSButton {
     var payload: NSDictionary?
+}
+
+private final class ProcessTrafficRowView: NSView {
+    private let rankLabel = NSTextField(labelWithString: "")
+    private let iconView = NSImageView()
+    private let nameLabel = NSTextField(labelWithString: "")
+    private let downloadLabel = NSTextField(labelWithString: "")
+    private let uploadLabel = NSTextField(labelWithString: "")
+
+    init(rank: Int) {
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.cornerRadius = 4
+        rankLabel.stringValue = "\(rank)"
+        rankLabel.alignment = .center
+        rankLabel.font = .monospacedDigitSystemFont(ofSize: 8.5, weight: .semibold)
+        rankLabel.textColor = .tertiaryLabelColor
+        iconView.imageScaling = .scaleProportionallyUpOrDown
+        nameLabel.font = .systemFont(ofSize: 9.5, weight: .medium)
+        nameLabel.lineBreakMode = .byTruncatingMiddle
+        nameLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        downloadLabel.textColor = MenuBarTrafficColors.download
+        uploadLabel.textColor = MenuBarTrafficColors.upload
+        for label in [downloadLabel, uploadLabel] {
+            label.font = .monospacedSystemFont(ofSize: 9, weight: .medium)
+            label.alignment = .right
+            label.translatesAutoresizingMaskIntoConstraints = false
+            label.widthAnchor.constraint(equalToConstant: 72).isActive = true
+        }
+        let nameStack = NSStackView(views: [iconView, nameLabel])
+        nameStack.orientation = .horizontal; nameStack.spacing = 4; nameStack.alignment = .centerY
+        let spacer = NSView(); spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let row = NSStackView(views: [rankLabel, nameStack, spacer, downloadLabel, uploadLabel])
+        row.orientation = .horizontal; row.spacing = 5; row.alignment = .centerY
+        row.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(row)
+        NSLayoutConstraint.activate([
+            heightAnchor.constraint(equalToConstant: 15),
+            rankLabel.widthAnchor.constraint(equalToConstant: 12),
+            iconView.widthAnchor.constraint(equalToConstant: 13), iconView.heightAnchor.constraint(equalToConstant: 13),
+            row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 2),
+            row.trailingAnchor.constraint(equalTo: trailingAnchor),
+            row.topAnchor.constraint(equalTo: topAnchor), row.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    func configure(
+        name: String,
+        icon: NSImage?,
+        download: String,
+        upload: String
+    ) {
+        nameLabel.stringValue = name
+        nameLabel.toolTip = name
+        iconView.image = icon
+        downloadLabel.stringValue = download
+        uploadLabel.stringValue = upload
+        alphaValue = 1
+    }
+
+    func showPlaceholder() {
+        rankLabel.stringValue = ""
+        nameLabel.stringValue = "等待检测到活动进程…"
+        nameLabel.toolTip = nil
+        iconView.image = NSImage(systemSymbolName: "ellipsis", accessibilityDescription: nil)
+        downloadLabel.stringValue = "—"
+        uploadLabel.stringValue = "—"
+        alphaValue = 0.48
+    }
+
+    func clearSlot() {
+        rankLabel.stringValue = ""
+        nameLabel.stringValue = ""
+        nameLabel.toolTip = nil
+        iconView.image = nil
+        downloadLabel.stringValue = ""
+        uploadLabel.stringValue = ""
+        alphaValue = 0
+    }
 }
 
 private final class NetworkToggleSwitch: NSButton {
