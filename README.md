@@ -14,66 +14,50 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/HarenaGodz/LinkGlint/releases/latest"><strong>下载最新版</strong></a>
+  <a href="https://github.com/HarenaGodz/LinkGlint/releases/latest"><strong>下载最新版 DMG</strong></a>
   · <a href="CHANGELOG.md">更新日志</a>
   · <a href="docs/ARCHITECTURE.md">架构说明</a>
   · <a href="https://github.com/HarenaGodz/LinkGlint/issues">问题反馈</a>
 </p>
 
-<table>
-  <tr>
-    <td width="58%"><img src="docs/images/linkglint-3.5.1.png" alt="LinkGlint 主窗口"></td>
-    <td width="42%"><img src="docs/images/linkglint-panel-traffic-chart.png" alt="LinkGlint 快捷面板与流量曲线"></td>
-  </tr>
-</table>
+<p align="center"><img src="docs/images/linkglint-panel-traffic-chart.png" width="720" alt="LinkGlint 快捷面板"></p>
 
 LinkGlint 是一款轻量、原生的 macOS 菜单栏网络工具。
 
-## 核心功能
+## 功能
 
 - 显示当前网络、IP、实时上下行速度和最近 60 次流量曲线。
-- 快捷面板显示出口 IP（含国家与国旗）、进程实时流量 TOP 5，并支持面板置顶以便持续观察。
-- 管理 Wi‑Fi、有线、移动宽带和系统 VPN，支持 IPv4 / IPv6、DNS 与服务优先级。
+- 快捷面板显示出口 IP、地理位置和进程实时流量 TOP 5，并支持置顶。
+- 管理 Wi‑Fi、有线、移动宽带和系统 VPN，支持 IPv4、IPv6、DNS 与服务优先级。
 - 浏览并加入附近 Wi‑Fi，启停或切换网络服务。
-- 保存常用网络方案，并在切换时保留备用链路。
-- 支持登录启动、菜单栏实时预览与显示预设、单/双行网速、Byte/bit 单位和三种上下行标记。
-- 快捷面板支持网络质量检测、当前连接摘要复制、流量曲线与本地用量历史。
+- 保存网络方案，切换时保留备用链路。
+- 支持登录启动、菜单栏预览、显示预设、Byte/bit 单位和网络诊断。
 
-## 下载与安装
+## 安装
 
-要求 macOS 13 Ventura 或更高版本，支持 Apple Silicon 与 Intel。前往
-[GitHub Releases](https://github.com/HarenaGodz/LinkGlint/releases/latest) 下载 Universal 版本，解压后将 `LinkGlint.app` 拖入“应用程序”。若首次启动被拦截，请在访达中右击应用并选择“打开”。
+1. 从 [GitHub Releases](https://github.com/HarenaGodz/LinkGlint/releases/latest) 下载 Universal DMG。
+2. 打开 DMG，将 `LinkGlint` 拖到 `Applications` 文件夹。
+3. 首次启动若被 macOS 拦截，在访达中右击 LinkGlint 并选择“打开”。
 
-单击菜单栏图标打开状态面板，右击打开完整菜单。关闭主窗口后应用仍会在菜单栏运行。
-
-## 权限与隐私
-
-| 权限 | 用途 |
-| --- | --- |
-| 定位服务 | 读取附近 Wi‑Fi 名称，不读取或上传坐标 |
-| 管理员授权 | 安装受限助手，用于切换网络、修改 DNS 和优先级 |
-
-Wi‑Fi 密码只交给 CoreWLAN。偏好、方案和用量记录仅保存在本机；项目不含账号系统或遥测 SDK。
+首次启动或权限失效时需要完成一次管理员授权，以安装仅接受预定义网络命令的受限组件。详细权限和第三方查询说明见 [`docs/PRIVACY.md`](docs/PRIVACY.md)。
 
 ## 从源码构建
 
 需要 Xcode Command Line Tools 与 Swift 5.10：
 
 ```bash
-git clone https://github.com/HarenaGodz/LinkGlint.git
-cd LinkGlint
 ./build_app.sh
-open dist/LinkGlint.app
+swift test
+./scripts/verify.sh
+./scripts/package-dmg.sh
 ```
 
-运行测试、严格编译、打包与签名校验：
+构建细节、测试、DMG 和 Release 检查清单见 [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md)。
 
-```bash
-ARCHS="x86_64 arm64" ./scripts/verify.sh
-```
+## 文档与许可证
 
-实现细节见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)，版本变化见 [`CHANGELOG.md`](CHANGELOG.md)。欢迎提交 [Issue](https://github.com/HarenaGodz/LinkGlint/issues) 或 Pull Request。
-
-## 许可证
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)：模块与数据流
+- [`docs/PRIVACY.md`](docs/PRIVACY.md)：权限、网络查询和本地数据
+- [`CHANGELOG.md`](CHANGELOG.md)：版本变化
 
 [MIT License](LICENSE) · 由 **HarenaGodz（Harena）** 开发维护。
