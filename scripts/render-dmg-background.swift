@@ -60,7 +60,7 @@ let title = NSAttributedString(
     string: "安装 LinkGlint",
     attributes: [
         .font: NSFont.systemFont(ofSize: 18, weight: .semibold),
-        .foregroundColor: NSColor.white,
+        .foregroundColor: NSColor(calibratedWhite: 0.12, alpha: 1),
         .paragraphStyle: centeredParagraph()
     ]
 )
@@ -68,7 +68,7 @@ let subtitle = NSAttributedString(
     string: "将 LinkGlint 拖到 Applications 文件夹即可安装",
     attributes: [
         .font: NSFont.systemFont(ofSize: 11, weight: .regular),
-        .foregroundColor: NSColor.white.withAlphaComponent(0.88),
+        .foregroundColor: NSColor(calibratedWhite: 0.28, alpha: 1),
         .paragraphStyle: centeredParagraph()
     ]
 )
@@ -83,7 +83,7 @@ arrow.curve(
     controlPoint2: NSPoint(x: 360, y: 216)
 )
 arrow.lineWidth = 3.5
-NSColor.white.withAlphaComponent(0.9).setStroke()
+NSColor(calibratedWhite: 0.24, alpha: 0.72).setStroke()
 arrow.stroke()
 
 let arrowHead = NSBezierPath()
