@@ -67,6 +67,8 @@ struct NetworkDiagnosticPresentation: Equatable {
 }
 
 enum TrafficHistoryWindowFormatter {
+    static let fixedWidth = 9
+
     static func string(samples: [TrafficRateSample]) -> String {
         guard samples.count > 1, let first = samples.first, let last = samples.last else {
             return samples.isEmpty ? "等待样本" : "1 个样本"
@@ -80,6 +82,12 @@ enum TrafficHistoryWindowFormatter {
             return String(format: "近 %.1f 分钟", minutes)
         }
         return "近 \(Int(minutes.rounded())) 分钟"
+    }
+
+    static func fixedWidthString(samples: [TrafficRateSample], width: Int = fixedWidth) -> String {
+        let value = string(samples: samples)
+        guard width > value.count else { return value }
+        return String(repeating: " ", count: width - value.count) + value
     }
 }
 
@@ -213,7 +221,7 @@ struct NetworkStatusPresentation: Equatable {
         // state visible in the menu bar while preserving the physical network
         // symbol. The renderer adds a small lock badge beside that symbol.
         return .init(
-            title: "\(base.title) · VPN·已开启",
+            title: base.title,
             symbolName: base.symbolName,
             vpnConnected: true
         )
@@ -313,15 +321,13 @@ struct MenuBarRenderState: Equatable {
 enum MenuBarRenderPolicy {
     static func make(
         latestSymbolName: String,
-        latestPresentation: MenuBarTrafficPresentation,
-        renderedPresentation: MenuBarTrafficPresentation?,
-        panelIsOpen: Bool
+        latestPresentation: MenuBarTrafficPresentation
     ) -> MenuBarRenderState {
-        MenuBarRenderState(
+        // Always paint the latest sample. Freezing while the panel is open made
+        // the menu bar look stuck (especially when the panel is pinned).
+        return MenuBarRenderState(
             symbolName: latestSymbolName,
-            presentation: panelIsOpen
-                ? (renderedPresentation ?? latestPresentation)
-                : latestPresentation
+            presentation: latestPresentation
         )
     }
 }

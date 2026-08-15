@@ -242,25 +242,13 @@ final class NetworkStatusPresentationTests: XCTestCase {
         )
     }
 
-    func testOpenPanelFreezesTextButAcceptsLatestNetworkSymbol() {
-        let old = MenuBarTrafficPresentation(text: "↓1.0 MB/s\n↑20 KB/s", usesTwoLines: true)
+    func testOpenPanelUsesLatestTrafficText() {
         let latest = MenuBarTrafficPresentation(text: "↓900 MB/s\n↑8.0 MB/s", usesTwoLines: true)
 
         XCTAssertEqual(
             MenuBarRenderPolicy.make(
                 latestSymbolName: "wifi",
-                latestPresentation: latest,
-                renderedPresentation: old,
-                panelIsOpen: true
-            ),
-            MenuBarRenderState(symbolName: "wifi", presentation: old)
-        )
-        XCTAssertEqual(
-            MenuBarRenderPolicy.make(
-                latestSymbolName: "wifi",
-                latestPresentation: latest,
-                renderedPresentation: old,
-                panelIsOpen: false
+                latestPresentation: latest
             ),
             MenuBarRenderState(symbolName: "wifi", presentation: latest)
         )
@@ -384,7 +372,7 @@ final class NetworkStatusPresentationTests: XCTestCase {
             hasLoaded: true
         )
 
-        XCTAssertEqual(value.title, "无线·Office · VPN·已开启")
+        XCTAssertEqual(value.title, "无线·Office")
         XCTAssertEqual(value.symbolName, "wifi")
         XCTAssertTrue(value.vpnConnected)
     }
@@ -396,7 +384,7 @@ final class NetworkStatusPresentationTests: XCTestCase {
             activeVPNInterfaceNames: ["utun4"]
         )
 
-        XCTAssertEqual(value.title, "无线·Office · VPN·已开启")
+        XCTAssertEqual(value.title, "无线·Office")
         XCTAssertEqual(value.symbolName, "wifi")
         XCTAssertTrue(value.vpnConnected)
     }

@@ -20,18 +20,116 @@ final class NetworkManagerTests: XCTestCase {
         XCTAssertNil(PublicIPAddressParser.parse(""))
     }
 
+    func testParsesCloudflareTraceIP() {
+        let trace = """
+        fl=123f4
+        h=1.1.1.1
+        ip=203.0.113.8
+        ts=1710000000.000
+        visit_scheme=https
+        uag=curl
+        """
+        XCTAssertEqual(CloudflareTraceIPParser.parse(trace), "203.0.113.8")
+        XCTAssertEqual(
+            CloudflareTraceIPParser.parse("fl=1\nip=2001:db8::8\n"),
+            "2001:db8::8"
+        )
+        XCTAssertNil(CloudflareTraceIPParser.parse("fl=1\nh=1.1.1.1\n"))
+        XCTAssertNil(CloudflareTraceIPParser.parse(""))
+    }
+
+    func testParsesPublicIPCountryCode() {
+        XCTAssertEqual(PublicIPCountryCodeParser.parse("jp\n"), "JP")
+        XCTAssertEqual(PublicIPCountryCodeParser.parse("US"), "US")
+        XCTAssertNil(PublicIPCountryCodeParser.parse("Japan"))
+        XCTAssertNil(PublicIPCountryCodeParser.parse(""))
+    }
+
     func testParsesPublicIPInfoFromJSON() {
         let json = """
         {"ip":"203.0.113.8","hostname":"example","city":"Tokyo","region":"Tokyo","country":"JP","loc":"35.0,139.0","org":"AS64500 Example","postal":"100-0001","timezone":"Asia/Tokyo"}
         """
         XCTAssertEqual(
             PublicIPInfoParser.parse(json),
-            PublicIPInfo(address: "203.0.113.8", countryCode: "JP")
+            PublicIPInfo(
+                address: "203.0.113.8",
+                countryCode: "JP",
+                city: "Tokyo",
+                region: "Tokyo",
+                organization: "AS64500 Example",
+                timezone: "Asia/Tokyo"
+            )
         )
         XCTAssertEqual(
             PublicIPInfoParser.parse("{\"ip\":\"2001:db8::8\",\"country\":\"us\"}"),
             PublicIPInfo(address: "2001:db8::8", countryCode: "US")
         )
+    }
+
+    func testParsesGeoJSGeoInfo() {
+        let json = """
+        {"accuracy":20,"city":"Kuala Lumpur","continent_code":"AS","country":"Malaysia","country_code":"MY","ip":"56.68.99.174","organization":"AS16509 Amazon.com, Inc.","organization_name":"Amazon.com, Inc.","region":"Kuala Lumpur","timezone":"Asia/Kuala_Lumpur"}
+        """
+        XCTAssertEqual(
+            GeoJSGeoParser.parse(json),
+            PublicIPGeoInfo(
+                countryCode: "MY",
+                city: "Kuala Lumpur",
+                region: "Kuala Lumpur",
+                continentCode: "AS",
+                organization: "Amazon.com, Inc.",
+                timezone: "Asia/Kuala_Lumpur"
+            )
+        )
+        XCTAssertNil(GeoJSGeoParser.parse("{\"status\":429}"))
+        XCTAssertNil(GeoJSGeoParser.parse(""))
+    }
+
+    func testParsesGeoJSCombinedIPAndGeoJSON() {
+        let json = """
+        {"accuracy":20,"city":"Kuala Lumpur","continent_code":"AS","country":"Malaysia","country_code":"MY","ip":"56.68.99.174","organization":"AS16509 Amazon.com, Inc.","organization_name":"Amazon.com, Inc.","region":"Kuala Lumpur","timezone":"Asia/Kuala_Lumpur"}
+        """
+        XCTAssertEqual(
+            PublicIPInfoParser.parse(json),
+            PublicIPInfo(
+                address: "56.68.99.174",
+                countryCode: "MY",
+                city: "Kuala Lumpur",
+                region: "Kuala Lumpur",
+                continentCode: "AS",
+                organization: "Amazon.com, Inc.",
+                timezone: "Asia/Kuala_Lumpur"
+            )
+        )
+    }
+
+    func testFirstSuccessRaceReturnsFirstNonNil() {
+        XCTAssertEqual(FirstSuccessRace.first([{ nil }, { "second" }, { "third" }]), "second")
+        XCTAssertNil(FirstSuccessRace.first([{ nil }, { nil }]))
+        XCTAssertEqual(FirstSuccessRace.first([{ "only" }]), "only")
+        XCTAssertNil(FirstSuccessRace.first([]))
+    }
+
+    func testParallelFirstReturnsFastestNonNil() {
+        let start = Date()
+        let result = FirstSuccessRace.parallelFirst([
+            {
+                Thread.sleep(forTimeInterval: 0.15)
+                return "slow"
+            },
+            {
+                Thread.sleep(forTimeInterval: 0.02)
+                return "fast"
+            }
+        ])
+        let elapsed = Date().timeIntervalSince(start)
+        XCTAssertEqual(result, "fast")
+        XCTAssertLessThan(elapsed, 0.12)
+    }
+
+    func testParallelFirstReturnsNilWhenAllFail() {
+        XCTAssertNil(FirstSuccessRace.parallelFirst([{ nil }, { nil }]))
+        XCTAssertNil(FirstSuccessRace.parallelFirst([]))
     }
 
     func testRejectsInvalidPublicIPInfoJSON() {
@@ -45,10 +143,71 @@ final class NetworkManagerTests: XCTestCase {
         )
     }
 
+    func testFormatsPublicIPPanelPresentation() {
+        XCTAssertEqual(
+            PublicIPDisplayFormatter.panelPresentation(
+                address: "56.68.99.174",
+                countryCode: "MY",
+                city: "Kuala Lumpur",
+                region: "Kuala Lumpur",
+                continentCode: "AS",
+                organization: "Amazon.com, Inc.",
+                timezone: "Asia/Kuala_Lumpur"
+            ),
+            PublicIPPanelPresentation(
+                addressLine: "56.68.99.174",
+                countryLine: "🇲🇾 马来西亚",
+                detailLine: "Kuala Lumpur · 亚洲",
+                ownershipLine: "Amazon.com, Inc.",
+                toolTip: "最近检测：56.68.99.174\n🇲🇾 马来西亚 · Kuala Lumpur · 亚洲\n归属 Amazon.com, Inc.\n时区：Asia/Kuala_Lumpur"
+            )
+        )
+        XCTAssertEqual(
+            PublicIPDisplayFormatter.panelPresentation(
+                address: "203.0.113.8",
+                countryCode: "US",
+                city: "Ashburn",
+                region: "Virginia",
+                continentCode: "NA",
+                organization: nil,
+                timezone: "America/New_York"
+            ),
+            PublicIPPanelPresentation(
+                addressLine: "203.0.113.8",
+                countryLine: "🇺🇸 美国",
+                detailLine: "Ashburn · Virginia · 北美洲",
+                ownershipLine: nil,
+                toolTip: "最近检测：203.0.113.8\n🇺🇸 美国 · Ashburn · Virginia · 北美洲\n时区：America/New_York"
+            )
+        )
+        XCTAssertEqual(
+            PublicIPDisplayFormatter.panelPresentation(
+                address: nil,
+                countryCode: nil
+            ),
+            PublicIPPanelPresentation(
+                addressLine: "检测中…",
+                countryLine: nil,
+                detailLine: nil,
+                ownershipLine: nil,
+                toolTip: "正在检测出口 IP"
+            )
+        )
+        XCTAssertEqual(
+            PublicIPContinentFormatter.chineseName(for: "eu"),
+            "欧洲"
+        )
+        XCTAssertNil(PublicIPContinentFormatter.chineseName(for: "XX"))
+    }
+
     func testFormatsPublicIPDisplayWithChineseCountry() {
         XCTAssertEqual(
             PublicIPDisplayFormatter.string(address: "203.0.113.8", countryCode: "JP"),
             "203.0.113.8 · 🇯🇵 日本"
+        )
+        XCTAssertEqual(
+            PublicIPDisplayFormatter.string(address: "203.0.113.8", countryCode: "JP", city: "Tokyo"),
+            "203.0.113.8 · 🇯🇵 日本 · Tokyo"
         )
         XCTAssertEqual(
             PublicIPDisplayFormatter.string(address: "203.0.113.8", countryCode: nil),
@@ -57,6 +216,16 @@ final class NetworkManagerTests: XCTestCase {
         XCTAssertEqual(
             PublicIPDisplayFormatter.string(address: "203.0.113.8", countryCode: "ZZ"),
             "203.0.113.8"
+        )
+        XCTAssertEqual(
+            PublicIPDisplayFormatter.toolTip(
+                address: "203.0.113.8",
+                countryCode: "MY",
+                city: "Kuala Lumpur",
+                organization: "Amazon.com, Inc.",
+                timezone: "Asia/Kuala_Lumpur"
+            ),
+            "最近检测：203.0.113.8\n🇲🇾 马来西亚 · Kuala Lumpur\n归属 Amazon.com, Inc.\n时区：Asia/Kuala_Lumpur"
         )
     }
 
@@ -75,6 +244,16 @@ final class NetworkManagerTests: XCTestCase {
         XCTAssertEqual(
             PublicIPDisplayFormatter.string(address: "203.0.113.8", countryCode: "MO"),
             "203.0.113.8 · 🇨🇳 中国澳门"
+        )
+        XCTAssertEqual(
+            PublicIPDisplayFormatter.panelPresentation(
+                address: "203.0.113.8",
+                countryCode: "TW",
+                city: "Taipei",
+                continentCode: "AS",
+                organization: "Example ISP"
+            ).locationLine,
+            "🇨🇳 中国台湾 · Taipei · 亚洲"
         )
     }
 

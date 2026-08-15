@@ -30,6 +30,41 @@ enum PrivilegedAccessGuidance: Equatable {
             return .repair
         }
     }
+
+    var requiresBlockingSetup: Bool {
+        self != .none
+    }
+
+    var setupTitle: String {
+        switch self {
+        case .none:
+            return "配置网络管理权限"
+        case .firstRun:
+            return "欢迎使用 LinkGlint"
+        case .repair:
+            return "网络权限需要修复"
+        }
+    }
+
+    var setupMessage: String {
+        switch self {
+        case .none:
+            return "下一步会显示一次 macOS 管理员授权。LinkGlint 将安装仅用于网络设置的安全组件；完成后，日常网络修改不再输入密码。"
+        case .firstRun:
+            return "要使用快捷面板、偏好设置与网络切换，必须先完成一次管理员授权。菜单栏仍可查看速率。将安装仅接受预定义网络命令的安全组件；日常使用不会再询问密码。"
+        case .repair:
+            return "网络管理组件缺失、版本不一致或验证失败。请重新完成一次 macOS 管理员授权以恢复网络管理功能；菜单栏仍可查看速率，不会更改当前网络连接。"
+        }
+    }
+
+    var primaryActionTitle: String {
+        switch self {
+        case .none, .firstRun:
+            return "开始配置"
+        case .repair:
+            return "开始修复"
+        }
+    }
 }
 
 final class PrivilegedHelperManager {
@@ -82,7 +117,7 @@ final class PrivilegedHelperManager {
 
     func configureForCurrentUser() throws {
         guard let source = bundledHelperURL else {
-            throw NetworkError.commandFailed("应用包内缺少权限助手，请重新安装完整的 LinkGlint.app。")
+            throw NetworkError.commandFailed("应用包不完整，缺少网络管理组件，请重新安装完整的 LinkGlint.app。")
         }
         let username = NSUserName()
         guard username.range(of: #"^[A-Za-z0-9._-]{1,128}$"#, options: .regularExpression) != nil else {
@@ -152,7 +187,7 @@ final class PrivilegedHelperManager {
         }
         invalidateConfigurationCache()
         guard state == .ready else {
-            throw NetworkError.commandFailed("权限助手已安装，但免密码验证未通过。请点击“修复权限”重试。")
+            throw NetworkError.commandFailed("网络管理组件已安装，但免密码验证未通过。请点击“修复权限”重试。")
         }
     }
 

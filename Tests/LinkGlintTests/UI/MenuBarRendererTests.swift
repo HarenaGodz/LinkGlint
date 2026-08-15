@@ -124,7 +124,7 @@ final class MenuBarRendererTests: XCTestCase {
         let base = MenuBarRenderContext.preview
         let vpn = MenuBarRenderContext(
             symbolName: base.symbolName,
-            networkTitle: "\(base.networkTitle) · VPN·已开启",
+            networkTitle: base.networkTitle,
             vpnConnected: true,
             downloadBytesPerSecond: base.downloadBytesPerSecond,
             uploadBytesPerSecond: base.uploadBytesPerSecond,
@@ -132,13 +132,32 @@ final class MenuBarRendererTests: XCTestCase {
             showsSpeed: base.showsSpeed,
             usesTwoLines: base.usesTwoLines,
             usesBits: base.usesBits,
-            indicatorStyle: base.indicatorStyle,
-            panelIsOpen: false
+            indicatorStyle: base.indicatorStyle
         )
 
         let baseImage = try XCTUnwrap(renderer.renderPreview(context: base, appearance: appearance))
         let vpnImage = try XCTUnwrap(renderer.renderPreview(context: vpn, appearance: appearance))
         XCTAssertGreaterThan(vpnImage.size.width, baseImage.size.width)
-        XCTAssertEqual(vpnImage.accessibilityDescription, "无线·Office · VPN·已开启，↓1.2 MB/s  ↑42 KB/s")
+        XCTAssertEqual(vpnImage.accessibilityDescription, "无线·Office，↓1.2 MB/s  ↑42 KB/s")
+    }
+
+    func testMinimalModeVPNStatusItemLengthFitsCompositeIcon() {
+        let renderer = MenuBarRenderer()
+        let withoutVPN = renderer.statusItemLengthForTesting(showsText: false, vpnConnected: false)
+        let withVPN = renderer.statusItemLengthForTesting(showsText: false, vpnConnected: true)
+        XCTAssertEqual(withoutVPN, NSStatusItem.squareLength)
+        XCTAssertGreaterThanOrEqual(withVPN, 30)
+        XCTAssertEqual(
+            MenuBarRenderer.statusItemLength(showsText: false, imageWidth: 17),
+            NSStatusItem.squareLength
+        )
+        XCTAssertEqual(
+            MenuBarRenderer.statusItemLength(showsText: false, imageWidth: 23),
+            NSStatusItem.squareLength
+        )
+        XCTAssertEqual(
+            MenuBarRenderer.statusItemLength(showsText: false, imageWidth: 30),
+            30
+        )
     }
 }

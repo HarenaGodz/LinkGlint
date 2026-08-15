@@ -6,9 +6,11 @@ let package = Package(
     platforms: [.macOS(.v13)],
     products: [
         .executable(name: "LinkGlint", targets: ["LinkGlint"]),
-        .executable(name: "LinkGlintHelper", targets: ["LinkGlintHelper"])
+        .executable(name: "LinkGlintHelper", targets: ["LinkGlintHelper"]),
+        .library(name: "LinkGlintHelperSupport", targets: ["LinkGlintHelperSupport"])
     ],
     targets: [
+        .target(name: "LinkGlintHelperSupport"),
         .executableTarget(
             name: "LinkGlint",
             linkerSettings: [
@@ -16,7 +18,13 @@ let package = Package(
                 .linkedFramework("CoreWLAN")
             ]
         ),
-        .executableTarget(name: "LinkGlintHelper"),
-        .testTarget(name: "LinkGlintTests", dependencies: ["LinkGlint"])
+        .executableTarget(
+            name: "LinkGlintHelper",
+            dependencies: ["LinkGlintHelperSupport"]
+        ),
+        .testTarget(
+            name: "LinkGlintTests",
+            dependencies: ["LinkGlint", "LinkGlintHelperSupport"]
+        )
     ]
 )

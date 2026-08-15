@@ -168,9 +168,114 @@ enum PublicIPAddressParser {
     }
 }
 
+enum CloudflareTraceIPParser {
+    static func parse(_ output: String) -> String? {
+        for line in output.split(whereSeparator: \.isNewline) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard trimmed.hasPrefix("ip=") else { continue }
+            let value = String(trimmed.dropFirst(3))
+            if let address = PublicIPAddressParser.parse(value) { return address }
+        }
+        return nil
+    }
+}
+
 struct PublicIPInfo: Equatable {
     let address: String
     let countryCode: String?
+    let city: String?
+    let region: String?
+    let continentCode: String?
+    let organization: String?
+    let timezone: String?
+
+    init(
+        address: String,
+        countryCode: String? = nil,
+        city: String? = nil,
+        region: String? = nil,
+        continentCode: String? = nil,
+        organization: String? = nil,
+        timezone: String? = nil
+    ) {
+        self.address = address
+        self.countryCode = countryCode
+        self.city = city
+        self.region = region
+        self.continentCode = continentCode
+        self.organization = organization
+        self.timezone = timezone
+    }
+}
+
+struct PublicIPGeoInfo: Equatable {
+    let countryCode: String?
+    let city: String?
+    let region: String?
+    let continentCode: String?
+    let organization: String?
+    let timezone: String?
+
+    init(
+        countryCode: String? = nil,
+        city: String? = nil,
+        region: String? = nil,
+        continentCode: String? = nil,
+        organization: String? = nil,
+        timezone: String? = nil
+    ) {
+        self.countryCode = countryCode
+        self.city = city
+        self.region = region
+        self.continentCode = continentCode
+        self.organization = organization
+        self.timezone = timezone
+    }
+
+    var hasUsefulLocation: Bool {
+        countryCode != nil || city != nil || region != nil || continentCode != nil || organization != nil
+    }
+}
+
+struct PublicIPPanelPresentation: Equatable {
+    let addressLine: String
+    let countryLine: String?
+    let detailLine: String?
+    let ownershipLine: String?
+    let toolTip: String
+
+    /// Combined location for compact one-line displays (menu strings, tooltips).
+    var locationLine: String? {
+        let parts = [countryLine, detailLine].compactMap { $0 }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+}
+
+enum PublicIPCountryCodeParser {
+    static func parse(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let code = raw.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard code.count == 2, code.unicodeScalars.allSatisfy({ CharacterSet.letters.contains($0) }) else {
+            return nil
+        }
+        return code
+    }
+}
+
+enum PublicIPContinentFormatter {
+    static func chineseName(for code: String?) -> String? {
+        guard let code else { return nil }
+        switch code.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() {
+        case "AS": return "亚洲"
+        case "EU": return "欧洲"
+        case "NA": return "北美洲"
+        case "SA": return "南美洲"
+        case "AF": return "非洲"
+        case "OC": return "大洋洲"
+        case "AN": return "南极洲"
+        default: return nil
+        }
+    }
 }
 
 enum PublicIPInfoParser {
@@ -181,17 +286,65 @@ enum PublicIPInfoParser {
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let rawIP = json["ip"] as? String,
               let address = PublicIPAddressParser.parse(rawIP) else { return nil }
-        let countryCode = Self.normalizedCountryCode(json["country"] as? String)
-        return PublicIPInfo(address: address, countryCode: countryCode)
+        let geo = PublicIPGeoFieldsParser.parse(json)
+        return PublicIPInfo(
+            address: address,
+            countryCode: geo.countryCode,
+            city: geo.city,
+            region: geo.region,
+            continentCode: geo.continentCode,
+            organization: geo.organization,
+            timezone: geo.timezone
+        )
+    }
+}
+
+enum PublicIPGeoFieldsParser {
+    static func parse(_ json: [String: Any]) -> PublicIPGeoInfo {
+        let countryCode = PublicIPCountryCodeParser.parse(json["country_code"] as? String)
+            ?? PublicIPCountryCodeParser.parse(json["country"] as? String)
+        let city = cleanedText(json["city"] as? String)
+        let region = cleanedText(json["region"] as? String)
+        let continentCode = cleanedText(json["continent_code"] as? String)?.uppercased()
+        let organization = cleanedText(json["organization_name"] as? String)
+            ?? cleanedOrganization(json["organization"] as? String)
+            ?? cleanedText(json["org"] as? String)
+        let timezone = cleanedText(json["timezone"] as? String)
+        return PublicIPGeoInfo(
+            countryCode: countryCode,
+            city: city,
+            region: region,
+            continentCode: continentCode,
+            organization: organization,
+            timezone: timezone
+        )
     }
 
-    private static func normalizedCountryCode(_ raw: String?) -> String? {
+    private static func cleanedText(_ raw: String?) -> String? {
         guard let raw else { return nil }
-        let code = raw.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
-        guard code.count == 2, code.unicodeScalars.allSatisfy({ CharacterSet.letters.contains($0) }) else {
-            return nil
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+
+    private static func cleanedOrganization(_ raw: String?) -> String? {
+        guard var value = cleanedText(raw) else { return nil }
+        // geojs often prefixes "AS12345 ".
+        if value.uppercased().hasPrefix("AS"),
+           let space = value.firstIndex(of: " ") {
+            value = String(value[value.index(after: space)...]).trimmingCharacters(in: .whitespaces)
         }
-        return code
+        return value.isEmpty ? nil : value
+    }
+}
+
+enum GeoJSGeoParser {
+    static func parse(_ output: String) -> PublicIPGeoInfo? {
+        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let data = trimmed.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        let geo = PublicIPGeoFieldsParser.parse(json)
+        return geo.hasUsefulLocation ? geo : nil
     }
 }
 
@@ -205,18 +358,135 @@ enum PublicIPDisplayFormatter {
         "MO": ("🇨🇳", "中国澳门")
     ]
 
-    static func string(address: String, countryCode: String?) -> String {
-        guard let countryCode else { return address }
+    static func panelPresentation(
+        address: String?,
+        countryCode: String?,
+        city: String? = nil,
+        region: String? = nil,
+        continentCode: String? = nil,
+        organization: String? = nil,
+        timezone: String? = nil
+    ) -> PublicIPPanelPresentation {
+        guard let address else {
+            return PublicIPPanelPresentation(
+                addressLine: "检测中…",
+                countryLine: nil,
+                detailLine: nil,
+                ownershipLine: nil,
+                toolTip: "正在检测出口 IP"
+            )
+        }
+        let country = countryLine(countryCode: countryCode)
+        let detail = detailLine(
+            countryCode: countryCode,
+            city: city,
+            region: region,
+            continentCode: continentCode
+        )
+        let ownership = ownershipLine(organization: organization)
+        var tipLines = ["最近检测：\(address)"]
+        let locationParts = [country, detail].compactMap { $0 }
+        if !locationParts.isEmpty {
+            tipLines.append(locationParts.joined(separator: " · "))
+        }
+        if let ownership { tipLines.append("归属 \(ownership)") }
+        if let timezone, !timezone.isEmpty { tipLines.append("时区：\(timezone)") }
+        return PublicIPPanelPresentation(
+            addressLine: address,
+            countryLine: country,
+            detailLine: detail,
+            ownershipLine: ownership,
+            toolTip: tipLines.joined(separator: "\n")
+        )
+    }
+
+    static func string(
+        address: String,
+        countryCode: String?,
+        city: String? = nil
+    ) -> String {
+        let presentation = panelPresentation(
+            address: address,
+            countryCode: countryCode,
+            city: city
+        )
+        if let location = presentation.locationLine {
+            return "\(presentation.addressLine) · \(location)"
+        }
+        return presentation.addressLine
+    }
+
+    static func toolTip(
+        address: String,
+        countryCode: String?,
+        city: String? = nil,
+        organization: String? = nil,
+        timezone: String? = nil
+    ) -> String {
+        panelPresentation(
+            address: address,
+            countryCode: countryCode,
+            city: city,
+            organization: organization,
+            timezone: timezone
+        ).toolTip
+    }
+
+    private static func countryLine(countryCode: String?) -> String? {
+        guard let country = regionDisplay(for: countryCode) else { return nil }
+        return "\(country.flag) \(country.name)"
+    }
+
+    private static func detailLine(
+        countryCode: String?,
+        city: String?,
+        region: String?,
+        continentCode: String?
+    ) -> String? {
+        var parts: [String] = []
+        let countryName = regionDisplay(for: countryCode)?.name
+        if let city = distinctPlace(city, avoiding: [countryName].compactMap { $0 }) {
+            parts.append(city)
+        }
+        if let region = distinctPlace(region, avoiding: [countryName, city].compactMap { $0 }) {
+            parts.append(region)
+        }
+        if let continent = PublicIPContinentFormatter.chineseName(for: continentCode) {
+            parts.append(continent)
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    private static func ownershipLine(organization: String?) -> String? {
+        cleanedText(organization)
+    }
+
+    private static func regionDisplay(for countryCode: String?) -> (flag: String, name: String)? {
+        guard let countryCode else { return nil }
         if let override = sensitiveRegionDisplays[countryCode] {
-            return "\(address) · \(override.flag) \(override.name)"
+            return override
         }
         guard Locale.Region.isoRegions.contains(Locale.Region(countryCode)),
               let name = Locale(identifier: "zh_CN").localizedString(forRegionCode: countryCode),
               !name.isEmpty,
               let flag = flagEmoji(for: countryCode) else {
-            return address
+            return nil
         }
-        return "\(address) · \(flag) \(name)"
+        return (flag, name)
+    }
+
+    private static func distinctPlace(_ value: String?, avoiding: [String]) -> String? {
+        guard let cleaned = cleanedText(value) else { return nil }
+        for item in avoiding where cleaned.caseInsensitiveCompare(item) == .orderedSame {
+            return nil
+        }
+        return cleaned
+    }
+
+    private static func cleanedText(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
     }
 
     static func flagEmoji(for countryCode: String) -> String? {
@@ -432,78 +702,20 @@ final class CoreWLANAccessGate {
     }
 }
 
-enum CommandRunner {
-    @discardableResult
-    static func run(
-        _ executable: String,
-        _ arguments: [String] = [],
-        timeout: TimeInterval? = 20
-    ) throws -> String {
-        let process = Process()
-        let output = Pipe()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = arguments
-        process.standardOutput = output
-        process.standardError = output
-        try process.run()
-        let stateLock = NSLock()
-        var timedOut = false
-        let timeoutWork: DispatchWorkItem?
-        if let timeout {
-            let work = DispatchWorkItem {
-                stateLock.lock()
-                defer { stateLock.unlock() }
-                guard process.isRunning else { return }
-                timedOut = true
-                process.terminate()
-                let processID = process.processIdentifier
-                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1) {
-                    stateLock.lock()
-                    defer { stateLock.unlock() }
-                    if process.isRunning { kill(processID, SIGKILL) }
-                }
-            }
-            timeoutWork = work
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + max(timeout, 0.1), execute: work)
-        } else {
-            timeoutWork = nil
-        }
-        // Drain the pipe while the child is running. Waiting first can deadlock
-        // once output fills the kernel pipe buffer.
-        let data = output.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        timeoutWork?.cancel()
-        stateLock.lock()
-        let didTimeOut = timedOut
-        stateLock.unlock()
-        let text = String(data: data, encoding: .utf8) ?? ""
-        if didTimeOut {
-            let executableName = URL(fileURLWithPath: executable).lastPathComponent
-            throw NetworkError.commandFailed("命令 \(executableName) 执行超时，请稍后重试。")
-        }
-        guard process.terminationStatus == 0 else {
-            let detail = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            let executableName = URL(fileURLWithPath: executable).lastPathComponent
-            throw NetworkError.commandFailed(
-                detail.isEmpty
-                    ? "命令 \(executableName) 执行失败（状态 \(process.terminationStatus)）。"
-                    : detail
-            )
-        }
-        return text
-    }
-
-}
-
 final class NetworkManager {
     private let networksetup = "/usr/sbin/networksetup"
     private static let coreWLANAccessGate = CoreWLANAccessGate()
     private let privilegedHelper: PrivilegedHelperManager
+    private let egressIPClient: EgressIPClient
     private let wifiSSIDCacheLock = NSLock()
     private var wifiSSIDCache = WiFiSSIDStabilityCache()
 
-    init(privilegedHelper: PrivilegedHelperManager = PrivilegedHelperManager()) {
+    init(
+        privilegedHelper: PrivilegedHelperManager = PrivilegedHelperManager(),
+        egressIPClient: EgressIPClient = URLSessionEgressIPClient()
+    ) {
         self.privilegedHelper = privilegedHelper
+        self.egressIPClient = egressIPClient
     }
 
     var privilegedAccessState: PrivilegedAccessState { privilegedHelper.state }
@@ -710,23 +922,59 @@ final class NetworkManager {
         ))
     }
 
-    func fetchPublicIPInfo() throws -> PublicIPInfo {
-        guard let info = PublicIPInfoParser.parse(try CommandRunner.run(
-            "/usr/bin/curl",
-            ["--fail", "--silent", "--show-error", "--location", "--max-time", "4", "https://ipinfo.io/json"],
-            timeout: 5
-        )) else {
-            throw NetworkError.commandFailed("出口 IP 暂时不可用。")
-        }
-        return info
+    func fetchPublicIPAddress(vpnActive: Bool = false) async throws -> String {
+        try await egressIPClient.fetchAddress(vpnActive: vpnActive)
+    }
+
+    func fetchPublicIPGeoInfo(for address: String) async throws -> PublicIPGeoInfo {
+        try await egressIPClient.fetchGeoInfo(for: address)
+    }
+
+    func fetchPublicIPInfoCombined(vpnActive: Bool = false) async throws -> PublicIPInfo {
+        try await egressIPClient.fetchCombinedInfo(vpnActive: vpnActive)
     }
 
     /// Returns tunnel interfaces that have a routable address. macOS network
     /// extensions (for example FlClash's TUN mode) may create an active utun
     /// interface without registering a Network Service in `scutil --nc`.
     func fetchActiveVPNInterfaceNames() -> Set<String> {
-        guard let output = try? CommandRunner.run("/sbin/ifconfig", []) else { return [] }
-        return parseActiveVPNInterfaceNames(output)
+        var firstAddress: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&firstAddress) == 0, let firstAddress else { return [] }
+        defer { freeifaddrs(firstAddress) }
+
+        var addresses: [VPNInterfaceAddress] = []
+        var cursor: UnsafeMutablePointer<ifaddrs>? = firstAddress
+        while let current = cursor {
+            let entry = current.pointee
+            defer { cursor = entry.ifa_next }
+            guard let rawAddress = entry.ifa_addr else { continue }
+            let family = Int32(rawAddress.pointee.sa_family)
+            guard family == AF_INET || family == AF_INET6 else { continue }
+            let name = String(cString: entry.ifa_name)
+            guard name.hasPrefix("utun") || name.hasPrefix("ppp") || name.hasPrefix("tun") else {
+                continue
+            }
+
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            let length: socklen_t = family == AF_INET
+                ? socklen_t(MemoryLayout<sockaddr_in>.size)
+                : socklen_t(MemoryLayout<sockaddr_in6>.size)
+            guard getnameinfo(
+                rawAddress,
+                length,
+                &host,
+                socklen_t(host.count),
+                nil,
+                0,
+                NI_NUMERICHOST
+            ) == 0 else { continue }
+            addresses.append(VPNInterfaceAddress(
+                name: name,
+                address: String(cString: host),
+                isUp: entry.ifa_flags & UInt32(IFF_UP) != 0
+            ))
+        }
+        return ActiveVPNInterfaceDetector.activeInterfaceNames(in: addresses)
     }
 
     func runDiagnostics() -> NetworkDiagnostic {

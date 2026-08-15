@@ -9,7 +9,9 @@ final class TrafficChartView: NSView {
     }
 
     override var isFlipped: Bool { true }
-    override var intrinsicContentSize: NSSize { NSSize(width: NSView.noIntrinsicMetric, height: 46) }
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: NSView.noIntrinsicMetric, height: NSView.noIntrinsicMetric)
+    }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
