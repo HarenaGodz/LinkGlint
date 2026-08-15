@@ -100,7 +100,6 @@ struct MenuBarRenderContext: Equatable {
     let usesTwoLines: Bool
     let usesBits: Bool
     let indicatorStyle: MenuBarTrafficIndicatorStyle
-    let panelIsOpen: Bool
 
     init(
         symbolName: String,
@@ -112,8 +111,7 @@ struct MenuBarRenderContext: Equatable {
         showsSpeed: Bool,
         usesTwoLines: Bool,
         usesBits: Bool,
-        indicatorStyle: MenuBarTrafficIndicatorStyle,
-        panelIsOpen: Bool
+        indicatorStyle: MenuBarTrafficIndicatorStyle
     ) {
         self.symbolName = symbolName
         self.networkTitle = networkTitle
@@ -125,7 +123,6 @@ struct MenuBarRenderContext: Equatable {
         self.usesTwoLines = usesTwoLines
         self.usesBits = usesBits
         self.indicatorStyle = indicatorStyle
-        self.panelIsOpen = panelIsOpen
     }
 
     static let preview = MenuBarRenderContext(
@@ -138,8 +135,7 @@ struct MenuBarRenderContext: Equatable {
         showsSpeed: true,
         usesTwoLines: true,
         usesBits: false,
-        indicatorStyle: .coloredDots,
-        panelIsOpen: false
+        indicatorStyle: .coloredDots
     )
 
     func applying(preferences: AppPreferences) -> MenuBarRenderContext {
@@ -153,8 +149,7 @@ struct MenuBarRenderContext: Equatable {
             showsSpeed: preferences.showMenuBarSpeed,
             usesTwoLines: preferences.menuBarSpeedTwoLines,
             usesBits: preferences.menuBarSpeedInBits,
-            indicatorStyle: preferences.menuBarTrafficIndicatorStyle,
-            panelIsOpen: panelIsOpen
+            indicatorStyle: preferences.menuBarTrafficIndicatorStyle
         )
     }
 }
@@ -201,9 +196,7 @@ final class MenuBarRenderer {
         )
         let renderState = MenuBarRenderPolicy.make(
             latestSymbolName: context.symbolName,
-            latestPresentation: latestPresentation,
-            renderedPresentation: context.panelIsOpen ? lastRenderedPresentation : nil,
-            panelIsOpen: context.panelIsOpen
+            latestPresentation: latestPresentation
         )
         let presentation = renderState.presentation
         let appearanceName = button.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua])?.rawValue ?? ""
@@ -260,11 +253,15 @@ final class MenuBarRenderer {
             }
             let targetPosition: NSControl.ImagePosition = showsText ? .imageLeading : .imageOnly
             if button.imagePosition != targetPosition { button.imagePosition = targetPosition }
-            if button.imageScaling != .scaleProportionallyDown {
-                button.imageScaling = .scaleProportionallyDown
+            let targetScaling: NSImageScaling = showsText ? .scaleProportionallyDown : .scaleNone
+            if button.imageScaling != targetScaling { button.imageScaling = targetScaling }
+            let targetLength = Self.statusItemLength(
+                showsText: showsText,
+                imageWidth: button.image?.size.width ?? 0
+            )
+            if abs(statusItem.length - targetLength) > 0.5 {
+                statusItem.length = targetLength
             }
-            let targetLength = showsText ? NSStatusItem.variableLength : NSStatusItem.squareLength
-            if statusItem.length != targetLength { statusItem.length = targetLength }
         }
         return MenuBarRenderOutcome(renderedPresentation: presentation, renderKey: renderKey)
     }
@@ -452,7 +449,7 @@ final class MenuBarRenderer {
     }
 
     private func symbolImage(symbolName: String, accessibilityDescription: String) -> NSImage? {
-        let configuration = NSImage.SymbolConfiguration(pointSize: 15, weight: .semibold)
+        let configuration = NSImage.SymbolConfiguration(pointSize: 17, weight: .semibold)
         let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: accessibilityDescription)?
             .withSymbolConfiguration(configuration)
         image?.isTemplate = true
@@ -470,14 +467,16 @@ final class MenuBarRenderer {
         // Reserve three distinct horizontal zones: the complete network
         // symbol, a small gap, and the VPN lock at the lower-right. This keeps
         // the lock clear of both the symbol and any title drawn to its right.
-        let image = NSImage(size: NSSize(width: 27, height: 18), flipped: false) { rect in
-            guard let base = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil),
-                  let lock = NSImage(systemSymbolName: "lock.fill", accessibilityDescription: nil) else {
+        let image = NSImage(size: NSSize(width: 30, height: 20), flipped: false) { rect in
+            guard let base = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)?
+                    .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 17, weight: .semibold)),
+                  let lock = NSImage(systemSymbolName: "lock.fill", accessibilityDescription: nil)?
+                    .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 10, weight: .bold)) else {
                 return false
             }
             let baseSize = MenuBarIconLayout.fittedSize(
                 source: base.size,
-                bounding: NSSize(width: 18, height: 18)
+                bounding: NSSize(width: 19, height: 19)
             )
             base.draw(
                 in: NSRect(
@@ -492,11 +491,11 @@ final class MenuBarRenderer {
             )
             let lockSize = MenuBarIconLayout.fittedSize(
                 source: lock.size,
-                bounding: NSSize(width: 8, height: 8)
+                bounding: NSSize(width: 10, height: 10)
             )
             lock.draw(
                 in: NSRect(
-                    x: 18.5,
+                    x: 19.5,
                     y: 0.5,
                     width: lockSize.width,
                     height: lockSize.height
@@ -648,11 +647,11 @@ final class MenuBarRenderer {
         } else {
             geometry = .make(topWidth: topWidth, bottomWidth: plainBottomWidth)
         }
-        // VPN gets its own lower-right slot after the complete 18 pt network
-        // symbol. Four points of spacing after the slot protect the rate text.
-        let iconBoxSize = NSSize(width: vpnConnected ? 27 : 18, height: vpnConnected ? 18 : 16)
-        let baseSymbolBoxSize = NSSize(width: vpnConnected ? 18 : 18, height: vpnConnected ? 18 : 16)
-        let textSpacing: CGFloat = vpnConnected ? 1.5 : 4
+        // VPN gets its own lower-right slot after the complete network symbol.
+        // Keep the same text gap as the non-VPN layout so rates are not cramped.
+        let iconBoxSize = NSSize(width: vpnConnected ? 30 : 18, height: vpnConnected ? 20 : 16)
+        let baseSymbolBoxSize = NSSize(width: 18, height: vpnConnected ? 18 : 16)
+        let textSpacing: CGFloat = 4
         let textWidth = geometry.textWidth
         let imageSize = NSSize(width: iconBoxSize.width + textSpacing + textWidth, height: 20)
 
@@ -665,9 +664,10 @@ final class MenuBarRenderer {
                     width: baseSymbolBoxSize.width,
                     height: baseSymbolBoxSize.height
                 )
+                let foregroundColor = NSColor.labelColor
                 if let baseSymbol = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil) {
                     let pointConfiguration = NSImage.SymbolConfiguration(
-                        pointSize: vpnConnected ? 16 : 14,
+                        pointSize: vpnConnected ? 16 : 15,
                         weight: .semibold
                     )
                     let configuration: NSImage.SymbolConfiguration
@@ -699,15 +699,18 @@ final class MenuBarRenderer {
                 }
                 if vpnConnected,
                    let lock = NSImage(systemSymbolName: "lock.fill", accessibilityDescription: nil) {
-                    let lockConfiguration = NSImage.SymbolConfiguration(pointSize: 8, weight: .bold)
+                    let lockPoint = NSImage.SymbolConfiguration(pointSize: 10, weight: .bold)
+                    let lockConfiguration = lockPoint.applying(
+                        NSImage.SymbolConfiguration(paletteColors: [NSColor.secondaryLabelColor])
+                    )
                     let configuredLock = lock.withSymbolConfiguration(lockConfiguration) ?? lock
                     let lockSize = MenuBarIconLayout.fittedSize(
                         source: configuredLock.size,
-                        bounding: NSSize(width: 8, height: 8)
+                        bounding: NSSize(width: 10, height: 10)
                     )
                     configuredLock.draw(
                         in: NSRect(
-                            x: 18.5,
+                            x: 19.5,
                             y: 0.5,
                             width: lockSize.width,
                             height: lockSize.height
@@ -854,11 +857,30 @@ final class MenuBarPreviewView: NSView {
 }
 
 extension MenuBarRenderer {
+    /// `NSStatusItem.squareLength` is a sentinel (-2), not a point size. Only
+    /// replace it with an explicit width for the wider VPN composite icon (~30pt).
+    static func statusItemLength(showsText: Bool, imageWidth: CGFloat) -> CGFloat {
+        if showsText { return NSStatusItem.variableLength }
+        if imageWidth >= 28 {
+            return max(28, ceil(imageWidth))
+        }
+        return NSStatusItem.squareLength
+    }
+
     func makeAttributedTitleForTesting(
         text: String,
         networkTitle: String,
         indicatorStyle: MenuBarTrafficIndicatorStyle
     ) -> NSAttributedString {
         attributedTitle(text, networkTitle: networkTitle, indicatorStyle: indicatorStyle)
+    }
+
+    func statusItemLengthForTesting(showsText: Bool, vpnConnected: Bool, symbolName: String = "wifi") -> CGFloat {
+        let image = statusSymbolImage(
+            symbolName: symbolName,
+            vpnConnected: vpnConnected,
+            accessibilityDescription: "test"
+        )
+        return Self.statusItemLength(showsText: showsText, imageWidth: image?.size.width ?? 0)
     }
 }

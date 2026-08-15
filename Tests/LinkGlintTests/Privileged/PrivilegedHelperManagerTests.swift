@@ -20,6 +20,74 @@ final class PrivilegedHelperManagerTests: XCTestCase {
             .none
         )
     }
+
+    func testAccessGuidanceBlockingCopyForFirstRunAndRepair() {
+        let firstRun = PrivilegedAccessGuidance.firstRun
+        XCTAssertTrue(firstRun.requiresBlockingSetup)
+        XCTAssertEqual(firstRun.setupTitle, "欢迎使用 LinkGlint")
+        XCTAssertEqual(firstRun.primaryActionTitle, "开始配置")
+        XCTAssertTrue(firstRun.setupMessage.contains("管理员授权"))
+        XCTAssertFalse(firstRun.setupMessage.contains("助手"))
+
+        let repair = PrivilegedAccessGuidance.repair
+        XCTAssertTrue(repair.requiresBlockingSetup)
+        XCTAssertEqual(repair.setupTitle, "网络权限需要修复")
+        XCTAssertEqual(repair.primaryActionTitle, "开始修复")
+        XCTAssertTrue(repair.setupMessage.contains("重新完成"))
+        XCTAssertFalse(repair.setupMessage.contains("助手"))
+
+        XCTAssertFalse(PrivilegedAccessGuidance.none.requiresBlockingSetup)
+    }
+
+    func testSetupPresentationPolicyAvoidsRepeatedFocusSteal() {
+        XCTAssertFalse(
+            PrivilegedSetupPresentationPolicy.shouldStealFocus(
+                windowAlreadyVisible: true,
+                previousGuidance: .firstRun,
+                newGuidance: .firstRun
+            )
+        )
+        XCTAssertTrue(
+            PrivilegedSetupPresentationPolicy.shouldStealFocus(
+                windowAlreadyVisible: false,
+                previousGuidance: .firstRun,
+                newGuidance: .firstRun
+            )
+        )
+        XCTAssertTrue(
+            PrivilegedSetupPresentationPolicy.shouldStealFocus(
+                windowAlreadyVisible: true,
+                previousGuidance: .firstRun,
+                newGuidance: .repair
+            )
+        )
+        XCTAssertFalse(
+            PrivilegedSetupPresentationPolicy.shouldStealFocus(
+                windowAlreadyVisible: true,
+                previousGuidance: .repair,
+                newGuidance: .none
+            )
+        )
+    }
+
+    func testSetupPresentationPolicyKeepsCompletionPanelUntilAcknowledged() {
+        XCTAssertFalse(
+            PrivilegedSetupPresentationPolicy.shouldDismissSetupWhenAccessReady(
+                currentPhase: .completed
+            )
+        )
+        XCTAssertTrue(
+            PrivilegedSetupPresentationPolicy.shouldDismissSetupWhenAccessReady(
+                currentPhase: .guidance(.firstRun)
+            )
+        )
+        XCTAssertTrue(
+            PrivilegedSetupPresentationPolicy.shouldDismissSetupWhenAccessReady(
+                currentPhase: nil
+            )
+        )
+    }
+
     func testConfigurationCacheExpiresUsingMonotonicUptime() {
         var uptime: TimeInterval = 100
         var resolutionCount = 0

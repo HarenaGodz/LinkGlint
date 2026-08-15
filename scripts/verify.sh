@@ -11,7 +11,7 @@ echo "==> Treating compiler warnings as errors"
 swift build -Xswiftc -warnings-as-errors
 
 echo "==> Building LinkGlint.app"
-ARCHS="${ARCHS:-$(uname -m)}" ./build_app.sh
+ARCHS="${ARCHS:-x86_64 arm64}" ./build_app.sh
 
 APP="$ROOT/dist/LinkGlint.app"
 echo "==> Verifying bundle signature"
