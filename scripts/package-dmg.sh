@@ -8,8 +8,8 @@ DIST="$ROOT/dist"
 PLIST="$ROOT/Resources/App/Info.plist"
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")"
 BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$PLIST")"
-EXPECTED_VERSION="3.10.0"
-EXPECTED_BUILD="23"
+EXPECTED_VERSION="3.11.1"
+EXPECTED_BUILD="25"
 [[ "$VERSION" == "$EXPECTED_VERSION" ]] || { echo "Unexpected version: $VERSION" >&2; exit 1; }
 [[ "$BUILD" == "$EXPECTED_BUILD" ]] || { echo "Unexpected build: $BUILD" >&2; exit 1; }
 

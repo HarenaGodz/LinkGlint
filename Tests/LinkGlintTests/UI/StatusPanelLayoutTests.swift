@@ -175,6 +175,8 @@ final class StatusPanelLayoutTests: XCTestCase {
 
         XCTAssertEqual(meta.frame.height, emptyMetaHeight, accuracy: 0.5)
         XCTAssertEqual(meta.frame.height, StatusPanelIPCardLayout.metaBlockHeight, accuracy: 0.5)
+        XCTAssertEqual(StatusPanelIPCardLayout.intranetGeoLineHeight, 14, accuracy: 0.5)
+        XCTAssertEqual(StatusPanelIPCardLayout.intranetOwnershipLineHeight, 12, accuracy: 0.5)
         XCTAssertEqual(address.frame.maxY, title.frame.minY - 4, accuracy: 0.5)
     }
 
@@ -204,4 +206,5 @@ final class StatusPanelLayoutTests: XCTestCase {
             XCTAssertEqual(value.count, expectedWidth, "'\(value)'")
         }
     }
+
 }

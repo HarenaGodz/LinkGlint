@@ -2,6 +2,121 @@ import Foundation
 import Network
 import Darwin
 import CoreWLAN
+import CFNetwork
+
+/// Read-only snapshot of the local proxy path. It deliberately does not expose
+/// controls: LinkGlint can observe the path without taking ownership of Clash
+/// or changing the user's proxy configuration.
+struct ProxyPathSnapshot: Equatable {
+    let systemProxyEnabled: Bool?
+    let tunEnabled: Bool
+    let clashOutboundMode: ClashOutboundMode?
+    let intranetAddresses: [String]
+}
+
+enum ClashOutboundMode: String, Equatable {
+    case rule
+    case global
+    case direct
+
+    var displayName: String {
+        switch self {
+        case .rule: return "规则"
+        case .global: return "全局"
+        case .direct: return "直连"
+        }
+    }
+
+    static func parse(_ raw: String?) -> ClashOutboundMode? {
+        switch raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "rule": return .rule
+        case "global": return .global
+        case "direct": return .direct
+        default: return nil
+        }
+    }
+}
+
+enum ProxyPathDetector {
+    static func snapshot(tunEnabled: Bool, clashOutboundMode: ClashOutboundMode? = nil) -> ProxyPathSnapshot {
+        ProxyPathSnapshot(
+            systemProxyEnabled: systemProxyEnabled(),
+            tunEnabled: tunEnabled,
+            clashOutboundMode: clashOutboundMode,
+            intranetAddresses: intranetAddresses()
+        )
+    }
+
+    static func systemProxyEnabled() -> Bool? {
+        guard let unmanaged = CFNetworkCopySystemProxySettings(),
+              let settings = unmanaged.takeRetainedValue() as? [String: Any] else {
+            return nil
+        }
+        let keys = [
+            kCFNetworkProxiesHTTPEnable as String,
+            kCFNetworkProxiesHTTPSEnable as String,
+            kCFNetworkProxiesSOCKSEnable as String
+        ]
+        let values = keys.compactMap { settings[$0] as? NSNumber }
+        guard !values.isEmpty else { return false }
+        return values.contains { $0.boolValue }
+    }
+
+    /// Returns usable addresses on active, non-loopback interfaces. IPv6 is
+    /// preferred because it is the most useful representation in a compact
+    /// dashboard card, followed by IPv4. Link-local IPv6 is omitted.
+    static func intranetAddresses() -> [String] {
+        var firstAddress: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&firstAddress) == 0, let firstAddress else { return [] }
+        defer { freeifaddrs(firstAddress) }
+
+        var ipv6: [String] = []
+        var ipv4: [String] = []
+        var cursor: UnsafeMutablePointer<ifaddrs>? = firstAddress
+        while let current = cursor {
+            let entry = current.pointee
+            cursor = entry.ifa_next
+            guard let rawAddress = entry.ifa_addr,
+                  entry.ifa_flags & UInt32(IFF_UP) != 0,
+                  entry.ifa_flags & UInt32(IFF_LOOPBACK) == 0 else { continue }
+            let family = Int32(rawAddress.pointee.sa_family)
+            guard family == AF_INET || family == AF_INET6 else { continue }
+            let interface = String(cString: entry.ifa_name)
+            guard !interface.hasPrefix("utun") else {
+                // A TUN address is a virtual path, not the user's intranet
+                // address shown by FlClash's local-network card.
+                continue
+            }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            let length: socklen_t = family == AF_INET
+                ? socklen_t(MemoryLayout<sockaddr_in>.size)
+                : socklen_t(MemoryLayout<sockaddr_in6>.size)
+            guard getnameinfo(
+                rawAddress,
+                length,
+                &host,
+                socklen_t(host.count),
+                nil,
+                0,
+                NI_NUMERICHOST
+            ) == 0 else { continue }
+            let address = String(cString: host)
+            if family == AF_INET6 {
+                let normalized = address.lowercased()
+                guard normalized != "::", normalized != "::1", !normalized.hasPrefix("fe80:") else { continue }
+                ipv6.append(address)
+            } else {
+                guard !address.hasPrefix("127."), !address.hasPrefix("169.254.") else { continue }
+                ipv4.append(address)
+            }
+        }
+        var result: [String] = []
+        for address in ipv6 + ipv4 where !result.contains(address) {
+            result.append(address)
+        }
+        return result
+    }
+}
 
 struct WiFiNetwork: Equatable {
     let ssid: String
@@ -656,16 +771,54 @@ struct NetworkDiagnostic {
     let gatewayLatencyMilliseconds: Double?
     let dnsLookupSucceeded: Bool
     let systemDNSServers: [String]
+    let gatewayPacketLossPercent: Double?
+    let dnsLookupLatencyMilliseconds: Double?
+    let internetReachable: Bool?
+    let internetLatencyMilliseconds: Double?
+    let ipv6DefaultRouteAvailable: Bool
+
+    init(
+        date: Date,
+        defaultInterface: String?,
+        gateway: String?,
+        gatewayLatencyMilliseconds: Double?,
+        dnsLookupSucceeded: Bool,
+        systemDNSServers: [String],
+        gatewayPacketLossPercent: Double? = nil,
+        dnsLookupLatencyMilliseconds: Double? = nil,
+        internetReachable: Bool? = nil,
+        internetLatencyMilliseconds: Double? = nil,
+        ipv6DefaultRouteAvailable: Bool = false
+    ) {
+        self.date = date
+        self.defaultInterface = defaultInterface
+        self.gateway = gateway
+        self.gatewayLatencyMilliseconds = gatewayLatencyMilliseconds
+        self.dnsLookupSucceeded = dnsLookupSucceeded
+        self.systemDNSServers = systemDNSServers
+        self.gatewayPacketLossPercent = gatewayPacketLossPercent
+        self.dnsLookupLatencyMilliseconds = dnsLookupLatencyMilliseconds
+        self.internetReachable = internetReachable
+        self.internetLatencyMilliseconds = internetLatencyMilliseconds
+        self.ipv6DefaultRouteAvailable = ipv6DefaultRouteAvailable
+    }
 
     var summary: String {
         guard defaultInterface != nil else { return "未检测到默认网络" }
+        if internetReachable == false { return "外网不可达" }
+        if gatewayPacketLossPercent.map({ $0 >= 100 }) == true { return "网关不可达" }
         if gatewayLatencyMilliseconds != nil && dnsLookupSucceeded { return "网络状态良好" }
         if gatewayLatencyMilliseconds == nil && dnsLookupSucceeded { return "网络可用 · 网关未响应延迟检测" }
         if gatewayLatencyMilliseconds == nil { return "网络连通性需要检查" }
         return "DNS 查询异常"
     }
 
-    var isUsable: Bool { defaultInterface != nil && dnsLookupSucceeded }
+    var isUsable: Bool {
+        defaultInterface != nil
+            && dnsLookupSucceeded
+            && internetReachable != false
+            && gatewayPacketLossPercent.map { $0 < 100 } != false
+    }
 }
 
 enum NetworkError: LocalizedError {
@@ -707,15 +860,18 @@ final class NetworkManager {
     private static let coreWLANAccessGate = CoreWLANAccessGate()
     private let privilegedHelper: PrivilegedHelperManager
     private let egressIPClient: EgressIPClient
+    private let clashRuntimeStatusClient: ClashRuntimeStatusClient
     private let wifiSSIDCacheLock = NSLock()
     private var wifiSSIDCache = WiFiSSIDStabilityCache()
 
     init(
         privilegedHelper: PrivilegedHelperManager = PrivilegedHelperManager(),
-        egressIPClient: EgressIPClient = URLSessionEgressIPClient()
+        egressIPClient: EgressIPClient = URLSessionEgressIPClient(),
+        clashRuntimeStatusClient: ClashRuntimeStatusClient = ClashRuntimeStatusClient()
     ) {
         self.privilegedHelper = privilegedHelper
         self.egressIPClient = egressIPClient
+        self.clashRuntimeStatusClient = clashRuntimeStatusClient
     }
 
     var privilegedAccessState: PrivilegedAccessState { privilegedHelper.state }
@@ -926,6 +1082,10 @@ final class NetworkManager {
         try await egressIPClient.fetchAddress(vpnActive: vpnActive)
     }
 
+    func fetchDirectPublicIPAddress() async throws -> String {
+        try await egressIPClient.fetchDirectAddress()
+    }
+
     func fetchPublicIPGeoInfo(for address: String) async throws -> PublicIPGeoInfo {
         try await egressIPClient.fetchGeoInfo(for: address)
     }
@@ -977,40 +1137,85 @@ final class NetworkManager {
         return ActiveVPNInterfaceDetector.activeInterfaceNames(in: addresses)
     }
 
-    func runDiagnostics() -> NetworkDiagnostic {
+    /// Reads the local network path for the optional dashboard summary. This
+    /// method is intentionally cheap except for the loopback Clash probe and
+    /// should be called only while the shortcut panel is visible.
+    func fetchProxyPathSnapshot(tunEnabled: Bool) async -> ProxyPathSnapshot {
+        let mode = await clashRuntimeStatusClient.fetchMode()
+        return ProxyPathDetector.snapshot(tunEnabled: tunEnabled, clashOutboundMode: mode)
+    }
+
+    func runDiagnostics() async -> NetworkDiagnostic {
         let ipv4Route = try? CommandRunner.run("/sbin/route", ["-n", "get", "default"])
-        let routeOutput = ipv4Route
-            ?? (try? CommandRunner.run("/sbin/route", ["-n", "get", "-inet6", "default"]))
-            ?? ""
+        let ipv6RouteOutput = try? CommandRunner.run("/sbin/route", ["-n", "get", "-inet6", "default"])
+        let routeOutput = ipv4Route ?? ipv6RouteOutput ?? ""
         let defaultInterface = parseValue("interface", in: routeOutput)
         let gateway = parseValue("gateway", in: routeOutput)
-        let latency: Double?
+        let gatewayResult: (latency: Double?, loss: Double?)
         if let gateway {
             let ping = diagnosticPingInvocation(gateway: gateway)
-            let output = try? CommandRunner.run(ping.executable, ping.arguments, timeout: 2.5)
+            let output = try? CommandRunner.run(
+                ping.executable,
+                pingArguments(ping.arguments, count: 3),
+                timeout: 5
+            )
             if let output {
-                latency = parsePingLatency(output)
+                gatewayResult = (
+                    parsePingAverageLatency(output) ?? parsePingLatency(output),
+                    parsePingPacketLoss(output)
+                )
             } else {
-                latency = nil
+                gatewayResult = (nil, 100)
             }
         } else {
-            latency = nil
+            gatewayResult = (nil, nil)
         }
 
+        let dnsStartedAt = ProcessInfo.processInfo.systemUptime
         let dnsLookupOutput = (try? CommandRunner.run(
-            "/usr/bin/dscacheutil",
-            ["-q", "host", "-a", "name", "www.apple.com"]
+            "/usr/bin/dscacheutil", ["-q", "host", "-a", "name", "www.apple.com"], timeout: 3
         )) ?? ""
+        let dnsLatency = (ProcessInfo.processInfo.systemUptime - dnsStartedAt) * 1000
         let dnsOutput = (try? CommandRunner.run("/usr/sbin/scutil", ["--dns"])) ?? ""
+        let internet = await probeInternet()
 
         return NetworkDiagnostic(
             date: Date(),
             defaultInterface: defaultInterface,
             gateway: gateway,
-            gatewayLatencyMilliseconds: latency,
+            gatewayLatencyMilliseconds: gatewayResult.latency,
             dnsLookupSucceeded: dnsLookupDidResolve(dnsLookupOutput),
-            systemDNSServers: parseSystemDNSServers(dnsOutput)
+            systemDNSServers: parseSystemDNSServers(dnsOutput),
+            gatewayPacketLossPercent: gatewayResult.loss,
+            dnsLookupLatencyMilliseconds: dnsLookupOutput.isEmpty ? nil : dnsLatency,
+            internetReachable: internet.reachable,
+            internetLatencyMilliseconds: internet.latency,
+            ipv6DefaultRouteAvailable: ipv6RouteOutput != nil
         )
+    }
+
+    private func probeInternet() async -> (reachable: Bool, latency: Double?) {
+        var request = URLRequest(url: URL(string: "https://www.apple.com/library/test/success.html")!)
+        request.httpMethod = "HEAD"
+        request.timeoutInterval = 3
+        let started = ProcessInfo.processInfo.systemUptime
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, (200..<500).contains(http.statusCode) else {
+                return (false, nil)
+            }
+            return (true, (ProcessInfo.processInfo.systemUptime - started) * 1000)
+        } catch {
+            return (false, nil)
+        }
+    }
+
+    private func pingArguments(_ arguments: [String], count: Int) -> [String] {
+        var result = arguments
+        if let index = result.firstIndex(of: "-c"), result.indices.contains(index + 1) {
+            result[index + 1] = String(max(count, 1))
+        }
+        return result
     }
 
     func setService(_ name: String, enabled: Bool) throws {
@@ -1302,6 +1507,22 @@ final class NetworkManager {
 
     func parsePingLatency(_ output: String) -> Double? {
         let expression = #"time[=<]([0-9.]+)\s*ms"#
+        guard let regex = try? NSRegularExpression(pattern: expression),
+              let match = regex.firstMatch(in: output, range: NSRange(output.startIndex..., in: output)),
+              let range = Range(match.range(at: 1), in: output) else { return nil }
+        return Double(output[range])
+    }
+
+    func parsePingAverageLatency(_ output: String) -> Double? {
+        let expression = #"=\s*[0-9.]+/([0-9.]+)/[0-9.]+/[0-9.]+\s*ms"#
+        guard let regex = try? NSRegularExpression(pattern: expression),
+              let match = regex.firstMatch(in: output, range: NSRange(output.startIndex..., in: output)),
+              let range = Range(match.range(at: 1), in: output) else { return nil }
+        return Double(output[range])
+    }
+
+    func parsePingPacketLoss(_ output: String) -> Double? {
+        let expression = #"([0-9.]+)%\s*packet loss"#
         guard let regex = try? NSRegularExpression(pattern: expression),
               let match = regex.firstMatch(in: output, range: NSRange(output.startIndex..., in: output)),
               let range = Range(match.range(at: 1), in: output) else { return nil }

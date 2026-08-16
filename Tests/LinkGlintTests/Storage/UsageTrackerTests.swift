@@ -69,6 +69,19 @@ final class UsageTrackerTests: XCTestCase {
         XCTAssertEqual(tracker.usage(for: firstDay).receivedBytes, 100)
     }
 
+    func testDailyWindowIncludesEmptyDaysInCalendarOrder() {
+        let tracker = UsageTracker(defaults: defaults, key: "usage", calendar: calendar)
+        let firstDay = makeDate(2026, 7, 15)
+        let thirdDay = makeDate(2026, 7, 17)
+        tracker.record(receivedBytes: 100, sentBytes: 50, at: firstDay)
+        tracker.record(receivedBytes: 300, sentBytes: 75, at: thirdDay)
+
+        let window = tracker.dailyWindow(limit: 3, endingAt: thirdDay)
+        XCTAssertEqual(window.map(\.dateKey), ["2026-07-15", "2026-07-16", "2026-07-17"])
+        XCTAssertEqual(window[1].receivedBytes, 0)
+        XCTAssertEqual(window.last?.sentBytes, 75)
+    }
+
     func testPreferencesHaveExpectedDefaultsAndPersist() {
         let preferences = AppPreferences(defaults: defaults)
         XCTAssertTrue(preferences.showMenuBarTitle)

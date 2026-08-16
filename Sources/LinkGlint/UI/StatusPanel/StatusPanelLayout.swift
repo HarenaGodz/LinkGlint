@@ -63,10 +63,13 @@ enum StatusPanelTrafficCardLayout {
 
 /// Fixed-height IP meta block so geo lines loading do not reflow the card.
 enum StatusPanelIPCardLayout {
-    static let metaBlockHeight: CGFloat = 46
+    static let metaBlockHeight: CGFloat = 92
     static let countryLineHeight: CGFloat = 14
     static let detailLineHeight: CGFloat = 13
     static let ownershipLineHeight: CGFloat = 12
+    static let intranetLineHeight: CGFloat = 15
+    static let intranetGeoLineHeight: CGFloat = 14
+    static let intranetOwnershipLineHeight: CGFloat = 12
 
     static func configureMetaLine(_ label: NSTextField, height: CGFloat) {
         label.translatesAutoresizingMaskIntoConstraints = false
@@ -159,4 +162,3 @@ final class StatusPanelCardView: NSView {
             .withAlphaComponent(LinkGlintLayout.cardFillAlpha).cgColor
     }
 }
-

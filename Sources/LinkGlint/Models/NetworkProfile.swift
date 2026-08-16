@@ -169,6 +169,44 @@ final class NetworkProfileStore {
         return profile
     }
 
+    func profile(named name: String) -> NetworkProfile? {
+        let cleanName = Self.normalizedProfileName(name)
+        return profiles.first { $0.name.caseInsensitiveCompare(cleanName) == .orderedSame }
+    }
+
+    @discardableResult
+    func rename(id: UUID, to name: String) -> NetworkProfile? {
+        let cleanName = Self.normalizedProfileName(name)
+        var items = profiles
+        guard let index = items.firstIndex(where: { $0.id == id }) else { return nil }
+        guard !items.contains(where: { $0.id != id && $0.name.caseInsensitiveCompare(cleanName) == .orderedSame }) else {
+            return nil
+        }
+        items[index].name = cleanName
+        persist(items)
+        return items[index]
+    }
+
+    @discardableResult
+    func duplicate(id: UUID, name: String, now: Date = Date()) -> NetworkProfile? {
+        guard let source = profile(id: id) else { return nil }
+        let cleanName = Self.normalizedProfileName(name)
+        guard !profiles.contains(where: { $0.name.caseInsensitiveCompare(cleanName) == .orderedSame }) else {
+            return nil
+        }
+        let copy = NetworkProfile(
+            id: UUID(),
+            name: cleanName,
+            createdAt: now,
+            serviceStates: source.serviceStates,
+            wifiPowerStates: source.wifiPowerStates
+        )
+        var items = profiles
+        items.append(copy)
+        persist(items)
+        return copy
+    }
+
     func delete(id: UUID) {
         persist(profiles.filter { $0.id != id })
     }

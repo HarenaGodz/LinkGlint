@@ -1,17 +1,30 @@
 import Foundation
+import CFNetwork
 
 protocol EgressIPClient {
     func fetchAddress(vpnActive: Bool) async throws -> String
+    func fetchDirectAddress() async throws -> String
     func fetchGeoInfo(for address: String) async throws -> PublicIPGeoInfo
     func fetchCombinedInfo(vpnActive: Bool) async throws -> PublicIPInfo
 }
 
 final class URLSessionEgressIPClient: EgressIPClient, @unchecked Sendable {
     private let session: URLSession
+    private let directSession: URLSession
 
     init(session: URLSession? = nil) {
         if let session {
             self.session = session
+            let directConfiguration = URLSessionConfiguration.ephemeral
+            directConfiguration.httpCookieAcceptPolicy = .never
+            directConfiguration.httpShouldSetCookies = false
+            directConfiguration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+            directConfiguration.urlCache = nil
+            directConfiguration.timeoutIntervalForRequest = 2.5
+            directConfiguration.timeoutIntervalForResource = 3
+            directConfiguration.waitsForConnectivity = false
+            directConfiguration.connectionProxyDictionary = Self.proxyDisabledDictionary
+            self.directSession = URLSession(configuration: directConfiguration)
             return
         }
         let configuration = URLSessionConfiguration.ephemeral
@@ -23,29 +36,56 @@ final class URLSessionEgressIPClient: EgressIPClient, @unchecked Sendable {
         configuration.timeoutIntervalForResource = 3
         configuration.waitsForConnectivity = false
         self.session = URLSession(configuration: configuration)
+        let directConfiguration = URLSessionConfiguration.ephemeral
+        directConfiguration.httpCookieAcceptPolicy = .never
+        directConfiguration.httpShouldSetCookies = false
+        directConfiguration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        directConfiguration.urlCache = nil
+        directConfiguration.timeoutIntervalForRequest = 2.5
+        directConfiguration.timeoutIntervalForResource = 3
+        directConfiguration.waitsForConnectivity = false
+        directConfiguration.connectionProxyDictionary = Self.proxyDisabledDictionary
+        self.directSession = URLSession(configuration: directConfiguration)
     }
 
+    private static let proxyDisabledDictionary: [AnyHashable: Any] = [
+        kCFNetworkProxiesHTTPEnable as String: false,
+        kCFNetworkProxiesHTTPSEnable as String: false,
+        kCFNetworkProxiesSOCKSEnable as String: false
+    ]
+
     func fetchAddress(vpnActive: Bool) async throws -> String {
+        try await fetchAddress(using: session, vpnActive: vpnActive)
+    }
+
+    func fetchDirectAddress() async throws -> String {
+        try await fetchAddress(using: directSession, vpnActive: true)
+    }
+
+    private func fetchAddress(using session: URLSession, vpnActive: Bool) async throws -> String {
         let timeout = vpnActive ? 2.5 : 1.5
         let probes: [@Sendable () async -> String?] = [
             { [self] in
                 guard let text = try? await text(
                     from: URL(string: "https://1.1.1.1/cdn-cgi/trace")!,
-                    timeout: timeout
+                    timeout: timeout,
+                    session: session
                 ) else { return nil }
                 return CloudflareTraceIPParser.parse(text)
             },
             { [self] in
                 guard let text = try? await text(
                     from: URL(string: "https://api.ipify.org")!,
-                    timeout: timeout
+                    timeout: timeout,
+                    session: session
                 ) else { return nil }
                 return PublicIPAddressParser.parse(text)
             },
             { [self] in
                 guard let text = try? await text(
                     from: URL(string: "https://ipv4.icanhazip.com")!,
-                    timeout: timeout
+                    timeout: timeout,
+                    session: session
                 ) else { return nil }
                 return PublicIPAddressParser.parse(text)
             }
@@ -106,12 +146,16 @@ final class URLSessionEgressIPClient: EgressIPClient, @unchecked Sendable {
         )
     }
 
-    private func text(from url: URL, timeout: TimeInterval) async throws -> String {
+    private func text(
+        from url: URL,
+        timeout: TimeInterval,
+        session: URLSession? = nil
+    ) async throws -> String {
         var request = URLRequest(url: url)
         request.timeoutInterval = timeout
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         request.setValue("text/plain, application/json", forHTTPHeaderField: "Accept")
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await (session ?? self.session).data(for: request)
         try Task.checkCancellation()
         guard let response = response as? HTTPURLResponse,
               (200..<300).contains(response.statusCode),

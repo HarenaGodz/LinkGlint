@@ -57,6 +57,20 @@ final class UsageTracker {
         records.values.sorted { $0.dateKey > $1.dateKey }.prefix(max(limit, 0)).map { $0 }
     }
 
+    /// Returns a contiguous calendar window ending on `date`. Empty days are
+    /// included so charts and exports do not silently skip days on which
+    /// LinkGlint was not running.
+    func dailyWindow(limit: Int = 7, endingAt date: Date = Date()) -> [DailyNetworkUsage] {
+        let count = max(limit, 0)
+        guard count > 0 else { return [] }
+        return (0..<count).compactMap { offset in
+            guard let day = calendar.date(byAdding: .day, value: -offset, to: date) else {
+                return nil
+            }
+            return usage(for: day)
+        }.reversed()
+    }
+
     func resetToday(at date: Date = Date()) {
         let day = dateKey(for: date)
         records[day] = DailyNetworkUsage(dateKey: day, receivedBytes: 0, sentBytes: 0)

@@ -49,6 +49,18 @@ final class NetworkProfileStoreTests: XCTestCase {
         XCTAssertTrue(store.profiles.isEmpty)
     }
 
+    func testRenamesAndDuplicatesSnapshotWithoutCollidingNames() {
+        let original = store.saveSnapshot(name: "办公室", serviceStates: ["Wi-Fi": true], wifiPowerStates: [:])
+        XCTAssertNotNil(store.rename(id: original.id, to: "工作室"))
+        XCTAssertEqual(store.profile(id: original.id)?.name, "工作室")
+
+        let copy = store.duplicate(id: original.id, name: "家庭")
+        XCTAssertEqual(copy?.serviceStates["Wi-Fi"], true)
+        XCTAssertEqual(store.profiles.count, 2)
+        XCTAssertNil(store.rename(id: original.id, to: "家庭"))
+        XCTAssertNil(store.duplicate(id: original.id, name: "家庭"))
+    }
+
     func testBlankNameUsesFallback() {
         let profile = store.saveSnapshot(name: "   ", serviceStates: [:], wifiPowerStates: [:])
         XCTAssertEqual(profile.name, "未命名方案")

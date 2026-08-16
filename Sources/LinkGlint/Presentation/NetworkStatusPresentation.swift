@@ -49,7 +49,7 @@ struct NetworkDiagnosticPresentation: Equatable {
         guard let diagnostic else {
             return .init(
                 title: "网络检测",
-                detail: "检查默认路由、网关延迟与 DNS",
+                detail: "检查默认路由、网关、DNS 与外网",
                 isHealthy: nil
             )
         }
@@ -57,7 +57,19 @@ struct NetworkDiagnosticPresentation: Equatable {
         if let latency = diagnostic.gatewayLatencyMilliseconds {
             details.append(String(format: "网关 %.1f ms", latency))
         }
+        if let loss = diagnostic.gatewayPacketLossPercent, loss > 0 {
+            details.append(String(format: "丢包 %.0f%%", loss))
+        }
+        if let dnsLatency = diagnostic.dnsLookupLatencyMilliseconds {
+            details.append(String(format: "DNS %.0f ms", dnsLatency))
+        }
         details.append(diagnostic.dnsLookupSucceeded ? "DNS 正常" : "DNS 异常")
+        if let internetReachable = diagnostic.internetReachable {
+            details.append(internetReachable ? "外网正常" : "外网不可达")
+        }
+        if diagnostic.ipv6DefaultRouteAvailable {
+            details.append("IPv6 路由可用")
+        }
         return .init(
             title: diagnostic.isUsable ? "网络良好" : "需要检查",
             detail: details.joined(separator: " · "),

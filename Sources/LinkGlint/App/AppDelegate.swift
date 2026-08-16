@@ -7,8 +7,8 @@ import CoreLocation
 enum LinkGlintLayout {
     static let compactGap: CGFloat = 4
     static let standardGap: CGFloat = 8
-    static let panelWidth: CGFloat = 388
-    static let panelRowHeight: CGFloat = 46
+    static let panelWidth: CGFloat = 360
+    static let panelRowHeight: CGFloat = 40
     static let mainRowHeight: CGFloat = 52
     static let rowRadius: CGFloat = 8
     static let sectionRadius: CGFloat = 10
@@ -18,8 +18,10 @@ enum LinkGlintLayout {
     static let panelInsetY: CGFloat = 10
     static let panelInsetX: CGFloat = 12
     static let panelSectionGap: CGFloat = 8
-    static let panelBaseHeight: CGFloat = 400
-    static let trafficIPHeight: CGFloat = 102
+    // Includes the compact proxy-path card inspired by FlClash's dashboard.
+    // It remains read-only and only appears in the shortcut panel.
+    static let panelBaseHeight: CGFloat = 540
+    static let trafficIPHeight: CGFloat = 164
     static let processRowHeight: CGFloat = 19
     static let processRowSpacing: CGFloat = 3
     static let footerGap: CGFloat = 8
@@ -76,10 +78,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
     private weak var statusPanelTrafficChart: TrafficChartView?
     private weak var statusPanelProcessTrafficView: NSStackView?
     private weak var statusPanelIPAddressLabel: NSTextField?
-    private weak var statusPanelIPCountryLabel: NSTextField?
+    private weak var statusPanelIPLocationLabel: NSTextField?
     private weak var statusPanelIPDetailLabel: NSTextField?
-    private weak var statusPanelIPOwnershipLabel: NSTextField?
+    private weak var statusPanelIPOrganizationLabel: NSTextField?
+    private weak var statusPanelIPUpdatedLabel: NSTextField?
+    private weak var statusPanelIPIntranetLabel: NSTextField?
+    private weak var statusPanelIPIntranetCountryLabel: NSTextField?
+    private weak var statusPanelIPIntranetDetailLabel: NSTextField?
+    private weak var statusPanelIPIntranetOrganizationLabel: NSTextField?
+    private weak var statusPanelIPIntranetUpdatedLabel: NSTextField?
     private weak var statusPanelIPCard: NSView?
+    private weak var statusPanelIPRefreshButton: NSButton?
+    private weak var statusPanelIPCopyButton: NSButton?
     private var currentPublicIPAddress: String?
     private var currentPublicIPCountryCode: String?
     private var currentPublicIPCity: String?
@@ -87,6 +97,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
     private var currentPublicIPContinentCode: String?
     private var currentPublicIPOrganization: String?
     private var currentPublicIPTimezone: String?
+    private var currentPublicIPUpdatedAt: Date?
+    private var proxyPathProbeSequence: UInt64 = 0
+    private var currentProxyPathSnapshot: ProxyPathSnapshot?
+    private var currentIntranetIPAddress: String?
+    private var currentIntranetIPCountryCode: String?
+    private var currentIntranetIPCity: String?
+    private var currentIntranetIPRegion: String?
+    private var currentIntranetIPContinentCode: String?
+    private var currentIntranetIPOrganization: String?
+    private var currentIntranetIPTimezone: String?
+    private var currentIntranetIPUpdatedAt: Date?
+    private var currentIntranetIPGeoLoading = false
     private let egressIPRefreshCoordinator = EgressIPRefreshCoordinator()
     private var egressGeoGenerationByAddress: [String: Int] = [:]
     private var pendingEgressIPBurstWork: [DispatchWorkItem] = []
@@ -101,6 +123,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
     private weak var statusContextLoginItem: NSMenuItem?
     private var mainWindow: NSWindow!
     private var preferencesWindow: NSWindow?
+    private var usageHistoryWindowController: UsageHistoryWindowController?
     private var servicesStack: NSStackView!
     private var overviewLabel: NSTextField!
     private var diagnosticLabel: NSTextField!
@@ -559,6 +582,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
             #selector(setHighestPriorityMenu(_:)), #selector(renameNetworkService(_:)),
             #selector(applyProfileMenu(_:)), #selector(applySelectedProfile),
             #selector(saveCurrentProfile),
+            #selector(renameSelectedProfile), #selector(duplicateSelectedProfile),
             #selector(showPriorityEditor), #selector(showJoinWiFi(_:)),
             #selector(removePrivilegedAccess),
             #selector(showMainWindow), #selector(showPreferences)
@@ -575,6 +599,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
             #selector(setHighestPriorityMenu(_:)), #selector(renameNetworkService(_:)),
             #selector(applyProfileMenu(_:)), #selector(applySelectedProfile),
             #selector(saveCurrentProfile),
+            #selector(renameSelectedProfile), #selector(duplicateSelectedProfile),
             #selector(showPriorityEditor), #selector(showJoinWiFi(_:)),
             #selector(showPrivilegedAccessSetup), #selector(removePrivilegedAccess)
         ]
@@ -752,7 +777,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
             if !otherEnabledPhysicalServices.isEmpty || !service.enabled {
                 submenu.addItem(.separator())
                 let switchItem = NSMenuItem(
-                    title: "切换到此网络",
+                    title: "设为当前出口",
                     action: #selector(switchToService(_:)),
                     keyEquivalent: ""
                 )
@@ -826,7 +851,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         activityMenu.addItem(trafficItem)
         activityMenu.addItem(usageItem)
 
-        let usageHistory = NSMenuItem(title: "查看用量历史…", action: #selector(showUsageHistory), keyEquivalent: "")
+        let usageHistory = NSMenuItem(title: "打开用量中心…", action: #selector(showUsageHistory), keyEquivalent: "")
         usageHistory.target = self
         activityMenu.addItem(usageHistory)
 
@@ -1040,6 +1065,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         updateUsageDisplay()
         refreshEgressIPIfNeeded(force: true)
         scheduleEgressIPBurstRefresh()
+        refreshProxyPathSnapshot()
         startProcessTrafficSampling()
         installStatusPanelDismissalMonitors()
     }
@@ -1319,12 +1345,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
 
         let trafficChart = statusPanelTrafficChartCard()
         let ipStatus = statusPanelIPStatusCard()
-        let trafficIPRow = StatusPanelMidRowLayout.makeRow(leading: trafficChart, trailing: ipStatus)
-        trafficIPRow.setContentHuggingPriority(.init(1), for: .horizontal)
-        trafficIPRow.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         let processTraffic = statusPanelProcessTrafficCard()
         let footer = statusPanelFooter(services: services)
-        let stack = NSStackView(views: [brandHeader, sectionHeader, scroll, trafficIPRow, processTraffic, footer])
+        let stack = NSStackView(views: [brandHeader, sectionHeader, scroll, trafficChart, ipStatus, processTraffic, footer])
         stack.orientation = .vertical
         stack.alignment = .width
         stack.spacing = LinkGlintLayout.panelSectionGap
@@ -1336,14 +1359,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
             stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -LinkGlintLayout.panelInsetX),
             stack.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -LinkGlintLayout.panelInsetY),
             scroll.heightAnchor.constraint(equalToConstant: rowViewportHeight),
-            // NSStackView `.width` alignment does not reliably stretch; pin mid-row
-            // edges so traffic/IP cards stay flush instead of drifting trailing.
-            trafficIPRow.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
-            trafficIPRow.trailingAnchor.constraint(equalTo: stack.trailingAnchor)
+            // NSStackView `.width` alignment does not reliably stretch custom
+            // cards, so pin the two dashboard cards explicitly.
+            trafficChart.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
+            trafficChart.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
+            ipStatus.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
+            ipStatus.trailingAnchor.constraint(equalTo: stack.trailingAnchor)
         ])
         statusPopover.contentViewController = controller
         statusPopover.contentSize = NSSize(width: width, height: height)
         updateOperationFeedbackDisplays()
+        if statusPanelIsOpen {
+            refreshProxyPathSnapshot()
+        }
     }
 
     private func makeStatusPanelCard(content: NSView) -> StatusPanelCardView {
@@ -1399,7 +1427,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
             rates: rates,
             chart: chart
         )
-        return makeStatusPanelCard(content: content)
+        let card = makeStatusPanelCard(content: content)
+        card.heightAnchor.constraint(equalToConstant: 96).isActive = true
+        return card
     }
 
     private func statusPanelProcessTrafficCard() -> NSView {
@@ -1447,61 +1477,349 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         content.alignment = .width
         content.edgeInsets = LinkGlintLayout.cardPadding
         let card = makeStatusPanelCard(content: content)
+        card.heightAnchor.constraint(equalToConstant: 158).isActive = true
         statusPanelProcessTrafficView = rows
         updateStatusPanelProcessTraffic()
         return card
     }
 
     private func statusPanelIPStatusCard() -> NSView {
-        let title = NSTextField(labelWithString: "出口 IP")
+        let title = NSTextField(labelWithString: "IP 地址")
         title.font = .systemFont(ofSize: 10.5, weight: .semibold)
         title.textColor = .secondaryLabelColor
         title.setContentHuggingPriority(.defaultHigh, for: .vertical)
 
+        let headerSpacer = NSView()
+        headerSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let copy = NSButton(
+            image: NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: "复制出口 IP") ?? NSImage(),
+            target: self,
+            action: #selector(copyPublicIPAddress)
+        )
+        copy.bezelStyle = .texturedRounded
+        copy.controlSize = .mini
+        copy.toolTip = "复制出口 IP"
+        copy.setAccessibilityLabel("复制出口 IP")
+        copy.translatesAutoresizingMaskIntoConstraints = false
+        copy.widthAnchor.constraint(equalToConstant: 23).isActive = true
+        copy.heightAnchor.constraint(equalToConstant: 22).isActive = true
+        statusPanelIPCopyButton = copy
+        let refresh = NSButton(
+            image: NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "刷新出口 IP") ?? NSImage(),
+            target: self,
+            action: #selector(refreshPublicIPAddress)
+        )
+        refresh.bezelStyle = .texturedRounded
+        refresh.controlSize = .mini
+        refresh.toolTip = "刷新出口 IP"
+        refresh.setAccessibilityLabel("刷新出口 IP")
+        refresh.translatesAutoresizingMaskIntoConstraints = false
+        refresh.widthAnchor.constraint(equalToConstant: 23).isActive = true
+        refresh.heightAnchor.constraint(equalToConstant: 22).isActive = true
+        statusPanelIPRefreshButton = refresh
+        let titleRow = NSStackView(views: [title, headerSpacer, copy, refresh])
+        titleRow.orientation = .horizontal
+        titleRow.alignment = .centerY
+        titleRow.spacing = 4
+
+        func sectionHeading(_ text: String, symbol: String, color: NSColor) -> NSView {
+            let row = NSView()
+            row.translatesAutoresizingMaskIntoConstraints = false
+            let icon = NSImageView()
+            icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+            icon.symbolConfiguration = .init(pointSize: 10, weight: .semibold)
+            icon.contentTintColor = color
+            icon.translatesAutoresizingMaskIntoConstraints = false
+            icon.widthAnchor.constraint(equalToConstant: 14).isActive = true
+            icon.heightAnchor.constraint(equalToConstant: 14).isActive = true
+            let label = NSTextField(labelWithString: text)
+            label.font = .systemFont(ofSize: 10.5, weight: .semibold)
+            label.textColor = .secondaryLabelColor
+            label.alignment = .left
+            label.translatesAutoresizingMaskIntoConstraints = false
+            row.addSubview(icon)
+            row.addSubview(label)
+            NSLayoutConstraint.activate([
+                icon.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+                icon.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+                label.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 4),
+                label.trailingAnchor.constraint(lessThanOrEqualTo: row.trailingAnchor),
+                label.centerYAnchor.constraint(equalTo: row.centerYAnchor)
+            ])
+            return row
+        }
+
+        func metadataLabel(size: CGFloat, color: NSColor) -> NSTextField {
+            let label = NSTextField(labelWithString: "")
+            label.font = .systemFont(ofSize: size, weight: .regular)
+            label.textColor = color
+            label.alignment = .left
+            label.lineBreakMode = .byTruncatingTail
+            label.maximumNumberOfLines = 1
+            label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            return label
+        }
+
         let address = NSTextField(labelWithString: "检测中…")
-        address.font = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
-        address.alignment = .left
+        address.font = .monospacedDigitSystemFont(ofSize: 12.5, weight: .semibold)
         address.textColor = .labelColor
+        address.alignment = .left
         address.lineBreakMode = .byTruncatingMiddle
+        address.maximumNumberOfLines = 1
         address.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        address.setContentHuggingPriority(.defaultHigh, for: .vertical)
+        address.setAccessibilityLabel("公网出口 IP")
+        StatusPanelIPCardLayout.configureMetaLine(
+            address,
+            height: StatusPanelIPCardLayout.intranetLineHeight
+        )
         statusPanelIPAddressLabel = address
 
-        let country = NSTextField(labelWithString: "")
-        country.font = .systemFont(ofSize: 11, weight: .medium)
-        country.textColor = .labelColor
-        country.lineBreakMode = .byTruncatingTail
-        country.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        StatusPanelIPCardLayout.configureMetaLine(country, height: StatusPanelIPCardLayout.countryLineHeight)
-        statusPanelIPCountryLabel = country
+        let publicCountry = metadataLabel(size: 9.5, color: .labelColor)
+        StatusPanelIPCardLayout.configureMetaLine(
+            publicCountry,
+            height: StatusPanelIPCardLayout.countryLineHeight
+        )
+        statusPanelIPLocationLabel = publicCountry
+        let publicDetail = metadataLabel(size: 9, color: .secondaryLabelColor)
+        StatusPanelIPCardLayout.configureMetaLine(
+            publicDetail,
+            height: StatusPanelIPCardLayout.detailLineHeight
+        )
+        statusPanelIPDetailLabel = publicDetail
+        let publicOrganization = metadataLabel(size: 9, color: .tertiaryLabelColor)
+        StatusPanelIPCardLayout.configureMetaLine(
+            publicOrganization,
+            height: StatusPanelIPCardLayout.ownershipLineHeight
+        )
+        statusPanelIPOrganizationLabel = publicOrganization
+        let publicUpdated = metadataLabel(size: 8.5, color: .tertiaryLabelColor)
+        StatusPanelIPCardLayout.configureMetaLine(publicUpdated, height: 11)
+        statusPanelIPUpdatedLabel = publicUpdated
 
-        let detail = NSTextField(labelWithString: "")
-        detail.font = .systemFont(ofSize: 10, weight: .regular)
-        detail.textColor = .secondaryLabelColor
-        detail.lineBreakMode = .byTruncatingTail
-        detail.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        StatusPanelIPCardLayout.configureMetaLine(detail, height: StatusPanelIPCardLayout.detailLineHeight)
-        statusPanelIPDetailLabel = detail
+        let intranet = NSTextField(labelWithString: "检测中…")
+        intranet.font = .monospacedDigitSystemFont(ofSize: 12.5, weight: .semibold)
+        intranet.textColor = .labelColor
+        intranet.alignment = .left
+        intranet.lineBreakMode = .byTruncatingMiddle
+        intranet.maximumNumberOfLines = 1
+        intranet.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        intranet.setAccessibilityLabel("本机网络 IP")
+        StatusPanelIPCardLayout.configureMetaLine(
+            intranet,
+            height: StatusPanelIPCardLayout.intranetLineHeight
+        )
+        statusPanelIPIntranetLabel = intranet
+        let intranetCountry = metadataLabel(size: 9.5, color: .labelColor)
+        StatusPanelIPCardLayout.configureMetaLine(
+            intranetCountry,
+            height: StatusPanelIPCardLayout.countryLineHeight
+        )
+        statusPanelIPIntranetCountryLabel = intranetCountry
+        let intranetDetail = metadataLabel(size: 9, color: .secondaryLabelColor)
+        StatusPanelIPCardLayout.configureMetaLine(
+            intranetDetail,
+            height: StatusPanelIPCardLayout.detailLineHeight
+        )
+        statusPanelIPIntranetDetailLabel = intranetDetail
+        let intranetOrganization = metadataLabel(size: 9, color: .tertiaryLabelColor)
+        StatusPanelIPCardLayout.configureMetaLine(
+            intranetOrganization,
+            height: StatusPanelIPCardLayout.ownershipLineHeight
+        )
+        statusPanelIPIntranetOrganizationLabel = intranetOrganization
+        let intranetUpdated = metadataLabel(size: 8.5, color: .tertiaryLabelColor)
+        StatusPanelIPCardLayout.configureMetaLine(intranetUpdated, height: 11)
+        statusPanelIPIntranetUpdatedLabel = intranetUpdated
 
-        let ownership = NSTextField(labelWithString: "")
-        ownership.font = .systemFont(ofSize: 9.5, weight: .regular)
-        ownership.textColor = .tertiaryLabelColor
-        ownership.lineBreakMode = .byTruncatingTail
-        ownership.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        StatusPanelIPCardLayout.configureMetaLine(ownership, height: StatusPanelIPCardLayout.ownershipLineHeight)
-        statusPanelIPOwnershipLabel = ownership
+        func makeColumn(heading: NSView, lines: [(NSView, CGFloat)]) -> NSView {
+            let column = NSView()
+            column.translatesAutoresizingMaskIntoConstraints = false
+            heading.translatesAutoresizingMaskIntoConstraints = false
+            column.addSubview(heading)
+            var constraints = [
+                heading.topAnchor.constraint(equalTo: column.topAnchor),
+                heading.leadingAnchor.constraint(equalTo: column.leadingAnchor),
+                heading.trailingAnchor.constraint(equalTo: column.trailingAnchor),
+                heading.heightAnchor.constraint(equalToConstant: 14)
+            ]
+            var previous = heading
+            for (line, height) in lines {
+                line.translatesAutoresizingMaskIntoConstraints = false
+                column.addSubview(line)
+                constraints += [
+                    line.topAnchor.constraint(equalTo: previous.bottomAnchor, constant: 1),
+                    line.leadingAnchor.constraint(equalTo: column.leadingAnchor),
+                    line.trailingAnchor.constraint(equalTo: column.trailingAnchor),
+                    line.heightAnchor.constraint(equalToConstant: height)
+                ]
+                previous = line
+            }
+            constraints.append(previous.bottomAnchor.constraint(equalTo: column.bottomAnchor))
+            NSLayoutConstraint.activate(constraints)
+            return column
+        }
 
-        let meta = NSStackView(views: [country, detail, ownership])
-        meta.orientation = .vertical
-        meta.alignment = .width
-        meta.spacing = 2
-        meta.translatesAutoresizingMaskIntoConstraints = false
+        let publicColumn = makeColumn(
+            heading: sectionHeading("公网出口", symbol: "globe.asia.australia.fill", color: .systemBlue),
+            lines: [
+                (address, StatusPanelIPCardLayout.intranetLineHeight),
+                (publicCountry, StatusPanelIPCardLayout.countryLineHeight),
+                (publicDetail, StatusPanelIPCardLayout.detailLineHeight),
+                (publicOrganization, StatusPanelIPCardLayout.ownershipLineHeight),
+                (publicUpdated, 11)
+            ]
+        )
+        let intranetColumn = makeColumn(
+            heading: sectionHeading("本机网络", symbol: "network", color: .systemGreen),
+            lines: [
+                (intranet, StatusPanelIPCardLayout.intranetLineHeight),
+                (intranetCountry, StatusPanelIPCardLayout.countryLineHeight),
+                (intranetDetail, StatusPanelIPCardLayout.detailLineHeight),
+                (intranetOrganization, StatusPanelIPCardLayout.ownershipLineHeight),
+                (intranetUpdated, 11)
+            ]
+        )
 
-        let content = StatusPanelIPCardLayout.makeContent(title: title, address: address, meta: meta)
+        let divider = NSBox()
+        divider.boxType = .separator
+        let columns = NSView()
+        for view in [publicColumn, divider, intranetColumn] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            columns.addSubview(view)
+        }
+        NSLayoutConstraint.activate([
+            publicColumn.leadingAnchor.constraint(equalTo: columns.leadingAnchor),
+            publicColumn.topAnchor.constraint(equalTo: columns.topAnchor),
+            publicColumn.bottomAnchor.constraint(lessThanOrEqualTo: columns.bottomAnchor),
+            divider.leadingAnchor.constraint(equalTo: publicColumn.trailingAnchor, constant: 10),
+            divider.topAnchor.constraint(equalTo: columns.topAnchor),
+            divider.bottomAnchor.constraint(equalTo: columns.bottomAnchor),
+            divider.widthAnchor.constraint(equalToConstant: 1),
+            intranetColumn.leadingAnchor.constraint(equalTo: divider.trailingAnchor, constant: 10),
+            intranetColumn.trailingAnchor.constraint(equalTo: columns.trailingAnchor),
+            intranetColumn.topAnchor.constraint(equalTo: columns.topAnchor),
+            intranetColumn.bottomAnchor.constraint(lessThanOrEqualTo: columns.bottomAnchor),
+            intranetColumn.widthAnchor.constraint(equalTo: publicColumn.widthAnchor, multiplier: 1.2)
+        ])
+
+        let content = NSView()
+        titleRow.translatesAutoresizingMaskIntoConstraints = false
+        columns.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(titleRow)
+        content.addSubview(columns)
+        NSLayoutConstraint.activate([
+            titleRow.topAnchor.constraint(equalTo: content.topAnchor, constant: 10),
+            titleRow.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10),
+            titleRow.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -10),
+            columns.topAnchor.constraint(equalTo: titleRow.bottomAnchor, constant: 6),
+            columns.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10),
+            columns.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -10),
+            columns.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -10)
+        ])
         let card = makeStatusPanelCard(content: content)
+        card.heightAnchor.constraint(equalToConstant: 132).isActive = true
         statusPanelIPCard = card
+        card.setAccessibilityLabel("公网出口和本机网络 IP")
         updateStatusPanelIP()
         return card
+    }
+
+    private func refreshProxyPathSnapshot() {
+        guard statusPanelIsOpen else { return }
+        proxyPathProbeSequence &+= 1
+        let sequence = proxyPathProbeSequence
+        currentProxyPathSnapshot = nil
+        currentIntranetIPAddress = nil
+        currentIntranetIPCountryCode = nil
+        currentIntranetIPCity = nil
+        currentIntranetIPRegion = nil
+        currentIntranetIPContinentCode = nil
+        currentIntranetIPOrganization = nil
+        currentIntranetIPTimezone = nil
+        currentIntranetIPUpdatedAt = nil
+        currentIntranetIPGeoLoading = false
+        updateStatusPanelIP()
+        let tunEnabled = !activeVPNInterfaceNames.isEmpty
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            let snapshot = await self.manager.fetchProxyPathSnapshot(tunEnabled: tunEnabled)
+            DispatchQueue.main.async {
+                guard self.statusPanelIsOpen, self.proxyPathProbeSequence == sequence else { return }
+                self.currentProxyPathSnapshot = snapshot
+                self.prepareIntranetGeo(for: snapshot.intranetAddresses.first, sequence: sequence)
+                self.updateStatusPanelIP()
+            }
+        }
+    }
+
+    private func prepareIntranetGeo(for address: String?, sequence: UInt64) {
+        currentIntranetIPAddress = address
+        currentIntranetIPCountryCode = nil
+        currentIntranetIPCity = nil
+        currentIntranetIPRegion = nil
+        currentIntranetIPContinentCode = nil
+        currentIntranetIPOrganization = nil
+        currentIntranetIPTimezone = nil
+        currentIntranetIPUpdatedAt = nil
+        currentIntranetIPGeoLoading = false
+        guard let address else {
+            updateStatusPanelIP()
+            return
+        }
+        if address == currentPublicIPAddress {
+            currentIntranetIPCountryCode = currentPublicIPCountryCode
+            currentIntranetIPCity = currentPublicIPCity
+            currentIntranetIPRegion = currentPublicIPRegion
+            currentIntranetIPContinentCode = currentPublicIPContinentCode
+            currentIntranetIPOrganization = currentPublicIPOrganization
+            currentIntranetIPTimezone = currentPublicIPTimezone
+            currentIntranetIPUpdatedAt = currentPublicIPUpdatedAt
+            updateStatusPanelIP()
+            return
+        }
+        guard !isPrivateOrLocalAddress(address) else {
+            updateStatusPanelIP()
+            return
+        }
+        currentIntranetIPGeoLoading = true
+        updateStatusPanelIP()
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            let geo = try? await self.manager.fetchPublicIPGeoInfo(for: address)
+            DispatchQueue.main.async {
+                guard self.statusPanelIsOpen,
+                      self.proxyPathProbeSequence == sequence,
+                      self.currentIntranetIPAddress == address else { return }
+                self.currentIntranetIPGeoLoading = false
+                if let geo {
+                    self.currentIntranetIPCountryCode = geo.countryCode
+                    self.currentIntranetIPCity = geo.city
+                    self.currentIntranetIPRegion = geo.region
+                    self.currentIntranetIPContinentCode = geo.continentCode
+                    self.currentIntranetIPOrganization = geo.organization
+                    self.currentIntranetIPTimezone = geo.timezone
+                    self.currentIntranetIPUpdatedAt = Date()
+                }
+                self.updateStatusPanelIP()
+            }
+        }
+    }
+
+    private func isPrivateOrLocalAddress(_ address: String) -> Bool {
+        let value = address.lowercased().split(separator: "%", maxSplits: 1).first.map(String.init) ?? address.lowercased()
+        if value == "::" || value == "::1" || value.hasPrefix("fe80:")
+            || value.hasPrefix("fc") || value.hasPrefix("fd") {
+            return true
+        }
+        if value.hasPrefix("127.") || value.hasPrefix("10.") || value.hasPrefix("192.168.")
+            || value.hasPrefix("169.254.") {
+            return true
+        }
+        if let first = value.split(separator: ".").first.flatMap({ Int($0) }), first == 172,
+           let second = value.split(separator: ".").dropFirst().first.flatMap({ Int($0) }), (16...31).contains(second) {
+            return true
+        }
+        return false
     }
 
     private func updateStatusPanelIP() {
@@ -1516,15 +1834,98 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
             timezone: currentPublicIPTimezone
         )
         addressLabel.stringValue = presentation.addressLine
-        statusPanelIPCountryLabel?.stringValue = presentation.countryLine ?? ""
+        statusPanelIPLocationLabel?.stringValue = presentation.countryLine
+            ?? (currentPublicIPAddress == nil ? "等待公网地址…" : "归属信息暂不可用")
         statusPanelIPDetailLabel?.stringValue = presentation.detailLine ?? ""
-        statusPanelIPOwnershipLabel?.stringValue = presentation.ownershipLine ?? ""
-        let tip = presentation.toolTip
+        statusPanelIPOrganizationLabel?.stringValue = presentation.ownershipLine ?? ""
+        statusPanelIPUpdatedLabel?.stringValue = currentPublicIPUpdatedAt.map {
+            "更新 " + DateFormatter.localizedString(from: $0, dateStyle: .none, timeStyle: .short)
+        } ?? ""
+        let snapshot = currentProxyPathSnapshot
+        let intranetAddresses = snapshot?.intranetAddresses ?? ProxyPathDetector.intranetAddresses()
+        let intranetText = intranetAddresses.first ?? "暂不可用"
+        statusPanelIPIntranetLabel?.stringValue = intranetText
+        statusPanelIPIntranetLabel?.textColor = intranetAddresses.isEmpty ? .secondaryLabelColor : .labelColor
+        statusPanelIPIntranetLabel?.toolTip = intranetAddresses.isEmpty
+            ? "暂未读取到本机内网地址"
+            : intranetAddresses.joined(separator: "\n")
+
+        let intranetCountryText: String
+        let intranetDetailText: String
+        let intranetOrganizationText: String
+        let intranetUpdatedText: String
+        if let intranetAddress = intranetAddresses.first {
+            let localPresentation = PublicIPDisplayFormatter.panelPresentation(
+                address: intranetAddress,
+                countryCode: currentIntranetIPCountryCode,
+                city: currentIntranetIPCity,
+                region: currentIntranetIPRegion,
+                continentCode: currentIntranetIPContinentCode,
+                organization: currentIntranetIPOrganization,
+                timezone: currentIntranetIPTimezone
+            )
+            intranetCountryText = localPresentation.countryLine
+                ?? (isPrivateOrLocalAddress(intranetAddress)
+                    ? "本地私有地址"
+                    : (currentIntranetIPGeoLoading ? "归属信息查询中…" : "归属信息暂不可用"))
+            intranetDetailText = localPresentation.detailLine
+                ?? (isPrivateOrLocalAddress(intranetAddress) ? "不会上传或查询此地址" : "")
+            intranetOrganizationText = localPresentation.ownershipLine ?? ""
+            intranetUpdatedText = currentIntranetIPUpdatedAt.map {
+                "更新 " + DateFormatter.localizedString(from: $0, dateStyle: .none, timeStyle: .short)
+            } ?? ""
+        } else {
+            intranetCountryText = "未发现本机网络地址"
+            intranetDetailText = ""
+            intranetOrganizationText = ""
+            intranetUpdatedText = ""
+        }
+        statusPanelIPIntranetCountryLabel?.stringValue = intranetCountryText
+        statusPanelIPIntranetCountryLabel?.textColor = currentIntranetIPGeoLoading
+            ? .secondaryLabelColor : .labelColor
+        statusPanelIPIntranetDetailLabel?.stringValue = intranetDetailText
+        statusPanelIPIntranetOrganizationLabel?.stringValue = intranetOrganizationText
+        statusPanelIPIntranetUpdatedLabel?.stringValue = intranetUpdatedText
+        var tip = presentation.toolTip
+        if let intranetAddress = intranetAddresses.first {
+            tip += "\n内网 IP：\(intranetAddress)"
+            if let updated = currentIntranetIPUpdatedAt {
+                tip += " · 更新 " + DateFormatter.localizedString(from: updated, dateStyle: .none, timeStyle: .short)
+            }
+            if let organization = currentIntranetIPOrganization {
+                tip += "\n内网运营商：\(organization)"
+            }
+        }
         addressLabel.toolTip = tip
-        statusPanelIPCountryLabel?.toolTip = tip
+        statusPanelIPLocationLabel?.toolTip = tip
         statusPanelIPDetailLabel?.toolTip = tip
-        statusPanelIPOwnershipLabel?.toolTip = tip
+        statusPanelIPOrganizationLabel?.toolTip = tip
+        statusPanelIPUpdatedLabel?.toolTip = tip
+        statusPanelIPIntranetLabel?.toolTip = tip
+        statusPanelIPIntranetCountryLabel?.toolTip = tip
+        statusPanelIPIntranetDetailLabel?.toolTip = tip
+        statusPanelIPIntranetOrganizationLabel?.toolTip = tip
+        statusPanelIPIntranetUpdatedLabel?.toolTip = tip
         statusPanelIPCard?.toolTip = tip
+        let loading = egressIPRefreshCoordinator.isRunning
+        statusPanelIPRefreshButton?.isEnabled = !loading
+        statusPanelIPRefreshButton?.toolTip = loading ? "正在刷新出口 IP…" : "刷新出口 IP"
+        statusPanelIPRefreshButton?.setAccessibilityHelp(statusPanelIPRefreshButton?.toolTip ?? "刷新出口 IP")
+        statusPanelIPCopyButton?.isEnabled = currentPublicIPAddress != nil && !loading
+    }
+
+    @objc private func copyPublicIPAddress() {
+        guard let address = currentPublicIPAddress else {
+            NSSound.beep()
+            return
+        }
+        copyToPasteboard(address)
+        setOperationFeedback("出口 IP 已复制", color: .systemGreen, clearAfter: 2)
+    }
+
+    @objc private func refreshPublicIPAddress() {
+        refreshEgressIPIfNeeded(force: true)
+        updateStatusPanelIP()
     }
 
     private func refreshEgressIPIfNeeded(force: Bool = false) {
@@ -1556,6 +1957,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
                     DispatchQueue.main.async {
                         let applied = self.completeEgressIPFetchSuccess(ticket: ticket) {
                             self.currentPublicIPAddress = combined.address
+                            self.currentPublicIPUpdatedAt = Date()
                             self.currentPublicIPCountryCode = combined.countryCode
                             self.currentPublicIPCity = combined.city
                             self.currentPublicIPRegion = combined.region
@@ -1578,6 +1980,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
                     DispatchQueue.main.async {
                         let applied = self.completeEgressIPFetchSuccess(ticket: ticket) {
                             self.currentPublicIPAddress = address
+                            self.currentPublicIPUpdatedAt = Date()
                             self.currentPublicIPCountryCode = nil
                             self.currentPublicIPCity = nil
                             self.currentPublicIPRegion = nil
@@ -1608,6 +2011,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
                 let applied = self.completeEgressIPFetchSuccess(ticket: ticket) {
                     let ipChanged = address != previousAddress
                     self.currentPublicIPAddress = address
+                    self.currentPublicIPUpdatedAt = Date()
                     let hasCachedGeo = previousCountry != nil
                         || previousCity != nil
                         || previousRegion != nil
@@ -1844,7 +2248,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
             views.append(statusPanelBadge("当前", color: statusColor(for: service.kind)))
         }
         if NetworkServiceActionPolicy.offersSwitch(to: service) {
-            let use = NetworkActionButton(title: "切换", target: self, action: #selector(windowSwitchToService(_:)))
+            let use = NetworkActionButton(title: "设为出口", target: self, action: #selector(windowSwitchToService(_:)))
             use.bezelStyle = .rounded
             use.controlSize = .small
             use.payload = [
@@ -2248,6 +2652,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
                 }
                 self.activeVPNInterfaceNames = interfaces
                 self.refreshEgressIPIfNeeded(force: changed)
+                if changed {
+                    self.refreshProxyPathSnapshot()
+                }
                 if changed, !interfaces.isEmpty {
                     self.scheduleEgressIPBurstRefresh()
                 } else if interfaces.isEmpty {
@@ -2764,12 +3171,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
 
         updateSummaryLabel(
             statusPanelSummaryLabel,
-            text: NetworkServiceSummaryText.panel(services: lastServices),
+            text: summaryWithFreshness(NetworkServiceSummaryText.panel(services: lastServices)),
             color: .secondaryLabelColor
         )
         updateSummaryLabel(
             adapterSummaryLabel,
-            text: NetworkServiceSummaryText.mainWindow(services: lastServices),
+            text: summaryWithFreshness(NetworkServiceSummaryText.mainWindow(services: lastServices)),
             color: .secondaryLabelColor
         )
         updateNetworkControlAvailability()
@@ -2779,6 +3186,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         label?.stringValue = text
         label?.textColor = color
         label?.toolTip = text
+    }
+
+    private func summaryWithFreshness(_ summary: String) -> String {
+        guard let lastSuccessfulRefreshAt else { return summary }
+        let time = DateFormatter.localizedString(
+            from: lastSuccessfulRefreshAt,
+            dateStyle: .none,
+            timeStyle: .short
+        )
+        return "\(summary) · 更新 \(time)"
     }
 
     private var staleRefreshSummary: String? {
@@ -3542,17 +3959,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
             plan,
             services: lastServices
         )
-        if !leavesPhysicalServiceEnabled {
-            let alert = NSAlert()
-            alert.alertStyle = .warning
-            alert.messageText = "应用后将停用所有物理网络"
-            alert.informativeText = "方案“\(plan.title)”不会保留 Wi-Fi、有线或移动网络连接。"
-            alert.addButton(withTitle: "仍要应用")
-            alert.buttons.first?.hasDestructiveAction = true
-            alert.addButton(withTitle: "取消")
-            NSApp.activate(ignoringOtherApps: true)
-            guard alert.runModal() == .alertFirstButtonReturn else { return }
-        }
+        guard confirmProfileApplication(
+            plan,
+            skippedSuffix: skippedSuffix,
+            leavesPhysicalServiceEnabled: leavesPhysicalServiceEnabled
+        ) else { return }
         let readinessServices = NetworkProfileApplicationPlanner.readinessServiceNames(
             plan,
             services: lastServices
@@ -3593,6 +4004,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
+        if let existing = profileStore.profile(named: input.stringValue) {
+            let overwrite = NSAlert()
+            overwrite.alertStyle = .warning
+            overwrite.messageText = "覆盖已有方案“\(existing.name)”？"
+            overwrite.informativeText = "这会用当前网络状态替换原方案内容。"
+            overwrite.addButton(withTitle: "覆盖")
+            overwrite.buttons.first?.hasDestructiveAction = true
+            overwrite.addButton(withTitle: "取消")
+            NSApp.activate(ignoringOtherApps: true)
+            guard overwrite.runModal() == .alertFirstButtonReturn else { return }
+        }
+
         let states = Dictionary(
             lastServices.map { ($0.name, $0.enabled) },
             uniquingKeysWith: { _, latest in latest }
@@ -3631,6 +4054,93 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         profileStore.delete(id: id)
         updateProfilePopup()
         rebuildMenu(with: lastServices)
+    }
+
+    @objc private func renameSelectedProfile() {
+        guard let token = profilePopup.selectedItem?.representedObject as? String,
+              token.hasPrefix("profile:"),
+              let id = UUID(uuidString: String(token.dropFirst("profile:".count))),
+              let profile = profileStore.profile(id: id) else { return }
+        guard let name = promptForProfileName(
+            title: "重命名网络方案",
+            message: "为方案“\(profile.name)”输入新名称。",
+            initialValue: profile.name
+        ) else { return }
+        guard profileStore.rename(id: id, to: name) != nil else {
+            showError(NetworkError.commandFailed("已有同名网络方案，请使用其他名称。"))
+            return
+        }
+        updateProfilePopup(selecting: token)
+        rebuildMenu(with: lastServices)
+    }
+
+    @objc private func duplicateSelectedProfile() {
+        guard let token = profilePopup.selectedItem?.representedObject as? String,
+              token.hasPrefix("profile:"),
+              let id = UUID(uuidString: String(token.dropFirst("profile:".count))),
+              let profile = profileStore.profile(id: id) else { return }
+        guard let name = promptForProfileName(
+            title: "复制网络方案",
+            message: "为副本输入名称。原方案不会被修改。",
+            initialValue: "\(profile.name) 副本"
+        ) else { return }
+        guard let copy = profileStore.duplicate(id: id, name: name) else {
+            showError(NetworkError.commandFailed("已有同名网络方案，请使用其他名称。"))
+            return
+        }
+        updateProfilePopup(selecting: "profile:\(copy.id.uuidString)")
+        rebuildMenu(with: lastServices)
+    }
+
+    private func promptForProfileName(title: String, message: String, initialValue: String) -> String? {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: "确定")
+        alert.addButton(withTitle: "取消")
+        let input = NSTextField(string: initialValue)
+        input.placeholderString = "例如：办公室、家庭、仅扩展坞"
+        alert.accessoryView = AlertAccessoryView(width: 340, height: 26, content: input)
+        alert.window.initialFirstResponder = input
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        let name = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? nil : name
+    }
+
+    private func confirmProfileApplication(
+        _ plan: NetworkProfileApplicationPlan,
+        skippedSuffix: String,
+        leavesPhysicalServiceEnabled: Bool
+    ) -> Bool {
+        var changes: [String] = []
+        let servicesByName = Dictionary(lastServices.map { ($0.name, $0) }, uniquingKeysWith: { _, latest in latest })
+        for (name, enabled) in plan.serviceStates.sorted(by: { $0.key < $1.key }) {
+            guard let service = servicesByName[name], service.enabled != enabled else { continue }
+            changes.append("\(enabled ? "启用" : "停用")服务：\(NetworkDisplayText.singleLine(name))")
+        }
+        for (device, powered) in plan.wifiPowerStates.sorted(by: { $0.key < $1.key }) {
+            guard let service = lastServices.first(where: { $0.device == device && $0.kind == .wifi }),
+                  service.wifiPowered != powered else { continue }
+            changes.append("\(powered ? "打开" : "关闭") Wi‑Fi 硬件：\(device)")
+        }
+        let body = changes.isEmpty
+            ? "当前网络状态已经符合此方案。\(skippedSuffix)"
+            : changes.joined(separator: "\n") + (skippedSuffix.isEmpty ? "" : "\n\n\(skippedSuffix)")
+        let alert = NSAlert()
+        alert.alertStyle = leavesPhysicalServiceEnabled ? .informational : .warning
+        alert.messageText = leavesPhysicalServiceEnabled
+            ? "应用网络方案“\(plan.title)”？"
+            : "应用后将停用所有物理网络"
+        let warning = leavesPhysicalServiceEnabled
+            ? ""
+            : "此方案不会保留 Wi‑Fi、有线或移动网络连接。\n\n"
+        alert.informativeText = warning + body
+        alert.addButton(withTitle: changes.isEmpty ? "继续" : (leavesPhysicalServiceEnabled ? "应用" : "仍要应用"))
+        if !leavesPhysicalServiceEnabled { alert.buttons.first?.hasDestructiveAction = true }
+        alert.addButton(withTitle: "取消")
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
     private func updateProfilePopup(selecting selectedToken: String? = nil) {
@@ -3703,17 +4213,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
     }
 
     @objc private func showUsageHistory() {
-        var days = usageTracker.recentDays(limit: 7)
-        if days.isEmpty { days = [usageTracker.usage()] }
-        let body = days.map {
-            "\($0.dateKey)    ↓ \(formatBytes($0.receivedBytes))    ↑ \(formatBytes($0.sentBytes))"
-        }.joined(separator: "\n")
-        let alert = NSAlert()
-        alert.messageText = "最近 LinkGlint 用量记录"
-        alert.informativeText = body
-        alert.addButton(withTitle: "好")
-        NSApp.activate(ignoringOtherApps: true)
-        alert.runModal()
+        if usageHistoryWindowController == nil {
+            usageHistoryWindowController = UsageHistoryWindowController(
+                tracker: usageTracker,
+                formatBytes: { [weak self] bytes in self?.formatBytes(bytes) ?? "\(bytes) B" }
+            )
+        }
+        usageHistoryWindowController?.showWindow(nil)
     }
 
     @objc private func showStatusContextMenuFromPanel(_ sender: Any?) {
@@ -4334,14 +4840,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         diagnosticPending = false
         let generation = networkRefreshCoordinator.generation
         diagnosticLabel?.isHidden = false
-        diagnosticLabel?.stringValue = "网络诊断：正在检查网关与 DNS…"
+        diagnosticLabel?.stringValue = "网络诊断：正在检查网关、DNS 与外网…"
         diagnosticLabel?.textColor = .secondaryLabelColor
         updateStatusPanelDiagnosticButton()
 
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
-            let result = self.manager.runDiagnostics()
-            DispatchQueue.main.async {
+            let result = await self.manager.runDiagnostics()
+            await MainActor.run {
                 self.isDiagnosing = false
                 if generation == self.networkRefreshCoordinator.generation {
                     self.lastDiagnostic = result
@@ -4363,7 +4869,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         guard let button = statusPanelDiagnosticButton else { return }
         if isDiagnosing {
             button.title = "检测中…"
-            button.toolTip = "正在检查默认路由、网关延迟与 DNS"
+            button.toolTip = "正在检查默认路由、网关、DNS 与外网可达性"
             button.contentTintColor = .systemOrange
             button.isEnabled = false
         } else if networkMutationIsActive {
@@ -4429,7 +4935,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
             lines.append("默认接口：\(diagnostic.defaultInterface ?? "无")")
             lines.append("默认网关：\(diagnostic.gateway ?? "无")")
             lines.append("网关延迟：" + (diagnostic.gatewayLatencyMilliseconds.map { String(format: "%.3f ms", $0) } ?? "不可达"))
+            lines.append("网关丢包：" + (diagnostic.gatewayPacketLossPercent.map { String(format: "%.0f%%", $0) } ?? "未知"))
             lines.append("DNS 查询：www.apple.com · \(diagnostic.dnsLookupSucceeded ? "成功" : "失败")")
+            lines.append("DNS 耗时：" + (diagnostic.dnsLookupLatencyMilliseconds.map { String(format: "%.1f ms", $0) } ?? "未知"))
+            lines.append("外网 HTTPS：" + (diagnostic.internetReachable == true ? "可达" : (diagnostic.internetReachable == false ? "不可达" : "未知")))
+            lines.append("外网耗时：" + (diagnostic.internetLatencyMilliseconds.map { String(format: "%.1f ms", $0) } ?? "未知"))
+            lines.append("IPv6 默认路由：\(diagnostic.ipv6DefaultRouteAvailable ? "可用" : "未发现")")
             lines.append("系统 DNS：\(diagnostic.systemDNSServers.isEmpty ? "未发现" : diagnostic.systemDNSServers.joined(separator: ", "))")
         } else {
             lines.append("诊断结果：尚未运行主动诊断")
@@ -4645,7 +5156,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
 
         let adaptersTitle = NSTextField(labelWithString: "网络适配器")
         adaptersTitle.font = .systemFont(ofSize: 12.5, weight: .semibold)
-        let adapterHint = NSTextField(labelWithString: "开关用于启用或停用 · 更多操作在 ⋯")
+        let adapterHint = NSTextField(labelWithString: "开关：启用/停用 · 设为出口：调整默认链路 · 更多操作在 ⋯")
         adapterHint.font = .systemFont(ofSize: 10.5)
         adapterHint.textColor = .secondaryLabelColor
         let adapterHeaderSpacer = NSView()
@@ -4760,10 +5271,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         addToolItem(menu, title: "导出诊断报告…", symbol: "square.and.arrow.up", action: #selector(exportDiagnosticReport))
         menu.addItem(.separator())
         addToolItem(menu, title: "保存当前方案…", symbol: "plus.square", action: #selector(saveCurrentProfile))
+        addToolItem(menu, title: "重命名所选方案…", symbol: "pencil", action: #selector(renameSelectedProfile))
+        addToolItem(menu, title: "复制所选方案…", symbol: "plus.square.on.square", action: #selector(duplicateSelectedProfile))
         addToolItem(menu, title: "删除所选自定义方案…", symbol: "trash", action: #selector(deleteSelectedProfile))
         addToolItem(menu, title: "调整服务优先级…", symbol: "arrow.up.arrow.down", action: #selector(showPriorityEditor))
         menu.addItem(.separator())
-        addToolItem(menu, title: "用量历史…", symbol: "chart.bar", action: #selector(showUsageHistory))
+        addToolItem(menu, title: "用量中心…", symbol: "chart.bar.xaxis", action: #selector(showUsageHistory))
         addToolItem(menu, title: "重置今日用量…", symbol: "arrow.counterclockwise", action: #selector(resetTodayUsage))
         menu.addItem(.separator())
         addToolItem(menu, title: "打开网络设置…", symbol: "gear", action: #selector(openNetworkSettings))
@@ -4942,7 +5455,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         menu.addItem(title)
 
         if NetworkServiceActionPolicy.offersSwitch(to: service) {
-            let switchItem = NSMenuItem(title: "切换到此网络", action: #selector(switchToService(_:)), keyEquivalent: "")
+            let switchItem = NSMenuItem(title: "设为当前出口", action: #selector(switchToService(_:)), keyEquivalent: "")
             switchItem.target = self
             switchItem.image = NSImage(systemSymbolName: "arrow.triangle.swap", accessibilityDescription: nil)
             switchItem.representedObject = [
@@ -5080,7 +5593,6 @@ private final class NetworkActionButton: NSButton {
 }
 
 private final class ProcessTrafficRowView: NSView {
-    private let rankLabel = NSTextField(labelWithString: "")
     private let iconView = NSImageView()
     private let nameLabel = NSTextField(labelWithString: "")
     private let downloadLabel = NSTextField(labelWithString: "")
@@ -5095,10 +5607,6 @@ private final class ProcessTrafficRowView: NSView {
         if stripe {
             layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.06).cgColor
         }
-        rankLabel.stringValue = "\(rank)"
-        rankLabel.alignment = .center
-        rankLabel.font = .monospacedDigitSystemFont(ofSize: 9, weight: .semibold)
-        rankLabel.textColor = .tertiaryLabelColor
         iconView.imageScaling = .scaleProportionallyUpOrDown
         nameLabel.font = .systemFont(ofSize: 10, weight: .medium)
         nameLabel.lineBreakMode = .byTruncatingMiddle
@@ -5114,13 +5622,12 @@ private final class ProcessTrafficRowView: NSView {
         let nameStack = NSStackView(views: [iconView, nameLabel])
         nameStack.orientation = .horizontal; nameStack.spacing = 5; nameStack.alignment = .centerY
         let spacer = NSView(); spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let row = NSStackView(views: [rankLabel, nameStack, spacer, downloadLabel, uploadLabel])
+        let row = NSStackView(views: [nameStack, spacer, downloadLabel, uploadLabel])
         row.orientation = .horizontal; row.spacing = 5; row.alignment = .centerY
         row.translatesAutoresizingMaskIntoConstraints = false
         addSubview(row)
         NSLayoutConstraint.activate([
             heightAnchor.constraint(equalToConstant: LinkGlintLayout.processRowHeight),
-            rankLabel.widthAnchor.constraint(equalToConstant: 14),
             iconView.widthAnchor.constraint(equalToConstant: 14), iconView.heightAnchor.constraint(equalToConstant: 14),
             row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
             row.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -2),
@@ -5148,7 +5655,6 @@ private final class ProcessTrafficRowView: NSView {
     }
 
     func showPlaceholder() {
-        rankLabel.stringValue = ""
         nameLabel.stringValue = "等待检测到活动进程…"
         nameLabel.toolTip = nil
         iconView.image = NSImage(systemSymbolName: "ellipsis", accessibilityDescription: nil)
@@ -5158,7 +5664,6 @@ private final class ProcessTrafficRowView: NSView {
     }
 
     func clearSlot() {
-        rankLabel.stringValue = ""
         nameLabel.stringValue = ""
         nameLabel.toolTip = nil
         iconView.image = nil

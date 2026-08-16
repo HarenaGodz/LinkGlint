@@ -27,6 +27,7 @@ final class EgressIPRefreshCoordinator {
 
     var failureRetryAttempt: Int { max(consecutiveFailures - 1, 0) }
     var currentGeneration: Int { generation }
+    var isRunning: Bool { activeTicket != nil }
 
     init(geoCacheLifetime: TimeInterval = 6 * 60 * 60) {
         self.geoCacheLifetime = geoCacheLifetime

@@ -309,7 +309,7 @@ final class NetworkStatusPresentationTests: XCTestCase {
     func testDiagnosticPresentationAndTrafficWindowAreReadable() {
         XCTAssertEqual(
             NetworkDiagnosticPresentation.make(nil),
-            .init(title: "网络检测", detail: "检查默认路由、网关延迟与 DNS", isHealthy: nil)
+            .init(title: "网络检测", detail: "检查默认路由、网关、DNS 与外网", isHealthy: nil)
         )
         let diagnostic = NetworkDiagnostic(
             date: Date(timeIntervalSince1970: 1),
@@ -329,6 +329,27 @@ final class NetworkStatusPresentationTests: XCTestCase {
             TrafficRateSample(date: start.addingTimeInterval(125), downloadBytesPerSecond: 20, uploadBytesPerSecond: 2)
         ]
         XCTAssertEqual(TrafficHistoryWindowFormatter.string(samples: samples), "近 2.1 分钟")
+    }
+
+    func testDiagnosticPresentationIncludesNewHealthSignalsWhenAvailable() {
+        let diagnostic = NetworkDiagnostic(
+            date: Date(timeIntervalSince1970: 1),
+            defaultInterface: "en0",
+            gateway: "192.0.2.1",
+            gatewayLatencyMilliseconds: 8.4,
+            dnsLookupSucceeded: true,
+            systemDNSServers: ["192.0.2.53"],
+            gatewayPacketLossPercent: 10,
+            dnsLookupLatencyMilliseconds: 12.8,
+            internetReachable: true,
+            internetLatencyMilliseconds: 45.2,
+            ipv6DefaultRouteAvailable: true
+        )
+        let detail = NetworkDiagnosticPresentation.make(diagnostic).detail
+        XCTAssertTrue(detail.contains("丢包 10%"))
+        XCTAssertTrue(detail.contains("DNS 13 ms"))
+        XCTAssertTrue(detail.contains("外网正常"))
+        XCTAssertTrue(detail.contains("IPv6 路由可用"))
     }
 
     func testPrimaryEthernetWinsOverAnotherConnectedService() {

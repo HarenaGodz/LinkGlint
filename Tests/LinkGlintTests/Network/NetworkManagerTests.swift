@@ -20,6 +20,17 @@ final class NetworkManagerTests: XCTestCase {
         XCTAssertNil(PublicIPAddressParser.parse(""))
     }
 
+    func testParsesPingAverageLatencyAndPacketLoss() {
+        let output = """
+        --- 192.0.2.1 ping statistics ---
+        3 packets transmitted, 2 packets received, 33.3% packet loss
+        round-trip min/avg/max/stddev = 1.000/2.500/4.000/1.200 ms
+        """
+        let manager = NetworkManager()
+        XCTAssertEqual(manager.parsePingAverageLatency(output), 2.5)
+        XCTAssertEqual(manager.parsePingPacketLoss(output), 33.3)
+    }
+
     func testParsesCloudflareTraceIP() {
         let trace = """
         fl=123f4
@@ -784,6 +795,27 @@ final class TrafficSampleCalculatorTests: XCTestCase {
         )
         XCTAssertEqual(result.receivedBytes, 0)
         XCTAssertEqual(result.sentBytes, 0)
+    }
+
+    func testClashOutboundModeParserOnlyAcceptsSupportedModes() {
+        XCTAssertEqual(ClashOutboundMode.parse("rule"), .rule)
+        XCTAssertEqual(ClashOutboundMode.parse(" GLOBAL "), .global)
+        XCTAssertEqual(ClashOutboundMode.parse("Direct"), .direct)
+        XCTAssertNil(ClashOutboundMode.parse("script"))
+        XCTAssertNil(ClashOutboundMode.parse(nil))
+    }
+
+    func testProxyPathSnapshotPreservesReadOnlyState() {
+        let snapshot = ProxyPathSnapshot(
+            systemProxyEnabled: true,
+            tunEnabled: true,
+            clashOutboundMode: .rule,
+            intranetAddresses: ["240e:838:40:77d3:1cd6:3:1", "192.168.1.10"]
+        )
+        XCTAssertTrue(snapshot.systemProxyEnabled == true)
+        XCTAssertTrue(snapshot.tunEnabled)
+        XCTAssertEqual(snapshot.clashOutboundMode?.displayName, "规则")
+        XCTAssertEqual(snapshot.intranetAddresses.count, 2)
     }
 
     private func service(
