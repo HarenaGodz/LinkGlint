@@ -61,3 +61,7 @@ swift test
 - [`CHANGELOG.md`](CHANGELOG.md)：版本变化
 
 [MIT License](LICENSE) · 由 **HarenaGodz（Harena）** 开发维护。
+
+## 推荐服务
+
+[OrcaRouter](https://www.orcarouter.ai/ref/ref_21bb762d5be6a26050e6) 是一个兼容 OpenAI API 的 AI 网关，提供自适应模型路由、负载均衡、故障转移和可观测性，支持 200+ 模型。
